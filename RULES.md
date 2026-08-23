@@ -208,6 +208,31 @@ Halts block **entries only**. Exit monitoring never halts.
 
 ---
 
+## 8b. Implementation status
+
+Audited 2026-08-23. Fixed in this pass:
+
+| Issue | Was | Now |
+|---|---|---|
+| Failed sells | Position deleted even when the transaction failed | Sells return success/failure; position retained and retried |
+| Position state | Lost on restart | Persisted to SQLite, reconciled against wallet balance on startup |
+| Live equity | `cash=0` at start → instant −100% drawdown → hard stop | Wallet balance and SOL price fetched before trading; refuses to start blind |
+| Signal coverage | Analyzer said WATCH at 35%, bot bought anyway | `min_signal_coverage` enforced in both |
+| Holder decline | Treated as "unmeasured" | Three-state: None / measured / negative penalised |
+| Missing tax or rugged flag | Defaulted to safe values, silently PASSED | Return None → UNKNOWN → rejection |
+| §1.6, §7.3, §7.5, `strict_lp_check` | Config values, never enforced | Implemented |
+| §6.3.2 insider dump | Parameter existed, nothing computed it | Compares top-10 concentration against entry |
+
+Still outstanding: §3.1 smart-money cohort, §3.2 attention data, §2.7 deployer
+history, §2.11 impersonation, EVM safety in the bot (present in the analyzer
+only), and the analyzer/executor strategy mismatch below.
+
+**Analyzer and executor still differ.** `analyze.py` produces retracement
+entries, a structural stop and R-multiple targets; `sniper_bot.py` buys at
+market and exits on the §6 ladder. They agree on gates, scoring and sizing
+constraints, but not on entry timing or exit levels. Treat the analyzer as a
+screen, not as the plan the bot will follow.
+
 ## 9. Known limitations
 
 Stated plainly, because a rulebook that oversells itself is dangerous:

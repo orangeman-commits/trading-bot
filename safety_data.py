@@ -181,9 +181,17 @@ class ReportView:
         return _num(bal) / supply * 100
 
     # -- gate 2.9 ---------------------------------------------------------
-    def transfer_fee_pct(self) -> float:
-        fee = self.r.get("transferFee") or {}
-        return _num(fee.get("pct"), 0.0)
+    def transfer_fee_pct(self) -> Optional[float]:
+        """None when the field is absent.
+
+        Previously returned 0.0 for a missing transferFee, so a schema change
+        would silently report 'no tax' and PASS the gate. Absent data must
+        never resolve to the safe value.
+        """
+        fee = self.r.get("transferFee")
+        if not isinstance(fee, dict) or "pct" not in fee:
+            return None
+        return _num(fee.get("pct"), -1) if _num(fee.get("pct"), -1) >= 0 else None
 
     # -- authorities (cross-check against RPC) ----------------------------
     def authorities_clear(self) -> Optional[bool]:
@@ -217,8 +225,10 @@ class ReportView:
         v = self.r.get("score_normalised")
         return _num(v, -1) if v is not None else None
 
-    def rugged(self) -> bool:
-        return bool(self.r.get("rugged"))
+    def rugged(self) -> Optional[bool]:
+        """None when absent — a missing flag is not a clean bill of health."""
+        v = self.r.get("rugged")
+        return None if v is None else bool(v)
 
 
 def verify_schema(mint: str) -> None:

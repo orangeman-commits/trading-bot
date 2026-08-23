@@ -106,6 +106,7 @@ class Config:
 
     # -- §3 scoring -------------------------------------------------------
     min_score: int = 62
+    min_signal_coverage: float = 50.0   # must match analyze.py
     min_cohort_wallets: int = 3
     cohort_enabled: bool = False       # True once a verified wallet list exists
     sentiment_spike_multiple: float = 8.0
@@ -132,6 +133,7 @@ class Config:
     time_stop_min_gain_pct: float = 20.0
     volume_death_pct: float = 15.0
     liq_drop_exit_pct: float = 25.0
+    insider_dump_drop_pct: float = 5.0
     emergency_impact_pct: float = 10.0
 
     # -- §7 breakers ------------------------------------------------------
@@ -213,6 +215,8 @@ class Position:
     tp1_done: bool = False
     tp2_done: bool = False
     realised_usd: float = 0.0
+    failed_exits: int = 0
+    entry_top10: float = 0.0
 
     def gain_pct(self, price: float) -> float:
         return (price / self.entry_price - 1) * 100
@@ -414,9 +418,12 @@ class SafetyScreen:
         v = ReportView(rep)
         out: list[GateResult] = []
 
-        out.append(GateResult("2.0_rugged_flag",
-                              Verdict.REJECT if v.rugged() else Verdict.PASS,
-                              str(v.rugged())))
+        rugged = v.rugged()
+        out.append(GateResult(
+            "2.0_rugged_flag",
+            Verdict.UNKNOWN if rugged is None else
+            (Verdict.REJECT if rugged else Verdict.PASS),
+            "unknown" if rugged is None else str(rugged)))
 
         blocking = v.blocking_risks()
         out.append(GateResult("2.0_blocking_risks",
@@ -431,9 +438,13 @@ class SafetyScreen:
             "unknown" if rs is None else f"{rs:.0f}/100"))
 
         lp = v.lp_locked_pct()
+        if lp is None and not self.cfg.strict_lp_check:
+            LOG.warning("%s: LP lock unknown, strict_lp_check disabled — "
+                        "treating as advisory", cand.symbol)
         out.append(GateResult(
             "2.3_lp_burned",
-            Verdict.UNKNOWN if lp is None else
+            (Verdict.UNKNOWN if self.cfg.strict_lp_check else Verdict.PASS)
+            if lp is None else
             (Verdict.PASS if lp >= self.cfg.min_lp_burned_pct else Verdict.REJECT),
             "unknown" if lp is None else f"{lp:.1f}%"))
 
@@ -447,8 +458,9 @@ class SafetyScreen:
         fee = v.transfer_fee_pct()
         out.append(GateResult(
             "2.9_transfer_tax",
-            Verdict.PASS if fee < self.cfg.max_round_trip_tax_pct else Verdict.REJECT,
-            f"{fee:.2f}%"))
+            Verdict.UNKNOWN if fee is None else
+            (Verdict.PASS if fee < self.cfg.max_round_trip_tax_pct else Verdict.REJECT),
+            "unknown" if fee is None else f"{fee:.2f}%"))
 
         # 2.7 deployer history and 2.11 impersonation still need their own
         # datasets; RugCheck's danger risks partially cover 2.11.
@@ -535,6 +547,9 @@ def discovery_filters(c: Candidate, cfg: Config) -> list[GateResult]:
         gate("1.5_vol_liq_ratio",
              cfg.min_vol_liq_ratio <= c.vol_liq_ratio <= cfg.max_vol_liq_ratio,
              f"{c.vol_liq_ratio:.1f}x"),
+        gate("1.6_unique_traders",
+             (c.txns_buys_24h + c.txns_sells_24h) >= cfg.min_unique_traders_24h,
+             f"{c.txns_buys_24h + c.txns_sells_24h:,} txns (proxy)"),
         gate("1.7_buy_sell_ratio",
              cfg.min_buy_sell_ratio <= c.buy_sell_ratio <= cfg.max_buy_sell_ratio,
              f"{c.buy_sell_ratio:.2f}"),
@@ -553,7 +568,7 @@ class Scorer:
 
     def score(self, c: Candidate,
               cohort_buys: int = 0,
-              holder_growth_per_hr: float = 0.0,
+              holder_growth_per_hr: Optional[float] = None,
               sentiment: Optional[dict] = None) -> tuple[int, dict]:
         """Returns (score_0_100, parts).
 
@@ -588,12 +603,19 @@ class Scorer:
         parts["volume_quality"] = max(0.0, min(15.0, vq))
         available += 15.0
 
-        # Measurable only with observation history
-        if holder_growth_per_hr > 0:
-            parts["holder_growth"] = min(20.0, holder_growth_per_hr / 5.0)
-            available += 20.0
+        # Measurable only with observation history.
+        # None = never measured (excluded from the denominator).
+        # 0 or negative = MEASURED and bad — a token bleeding holders must
+        # score worse than one we simply haven't observed yet.
+        if holder_growth_per_hr is None:
+            parts["holder_growth"] = 0.0
         else:
-            parts["holder_growth"] = 0.0          # unmeasured, not zero-valued
+            available += 20.0
+            if holder_growth_per_hr >= 0:
+                parts["holder_growth"] = min(20.0, holder_growth_per_hr / 5.0)
+            else:
+                # Losing holders: negative contribution, floored at -10.
+                parts["holder_growth"] = max(-10.0, holder_growth_per_hr / 10.0)
 
         # Measurable only with a verified cohort list
         if self.cfg.cohort_enabled:
@@ -655,7 +677,10 @@ class PaperBroker:
             entry_hourly_volume=c.volume_24h / 24,
             high_water_price=c.price_usd)
 
-    def sell(self, pos: Position, price: float, fraction: float, reason: str) -> float:
+    def sell(self, pos: Position, price: float, fraction: float,
+             reason: str) -> SellResult:
+        if price <= 0:
+            return SellResult(False, error="no price")
         qty = pos.qty * fraction
         proceeds = qty * price
         pos.qty -= qty
@@ -663,7 +688,7 @@ class PaperBroker:
         self.cash += proceeds
         LOG.info("SELL %-10s %.0f%% @ %.10f (%+.1f%%) — %s",
                  pos.symbol, fraction * 100, price, pos.gain_pct(price), reason)
-        return proceeds
+        return SellResult(True, proceeds)
 
 
 class LiveBrokerAdapter:
@@ -676,13 +701,46 @@ class LiveBrokerAdapter:
         self.sol_usd = sol_usd_price
         self.cash = 0.0
 
+    SOL_MINT = "So11111111111111111111111111111111111111112"
+
     def _sol_price(self) -> float:
         if self.sol_usd > 0:
             return self.sol_usd
-        raise RuntimeError("SOL/USD price not set — call set_sol_price() each cycle")
+        raise RuntimeError("SOL/USD price unavailable")
 
     def set_sol_price(self, usd: float) -> None:
-        self.sol_usd = usd
+        if usd > 0:
+            self.sol_usd = usd
+
+    def refresh_state(self) -> bool:
+        """Pull live SOL price and wallet balance.
+
+        Must run before the first trade and on every cycle. Without it,
+        `cash` stays 0, equity reads 0 against a non-zero peak, and the §7.4
+        drawdown breaker hard-stops the bot the moment it starts.
+        """
+        ok = True
+        try:
+            import requests
+            r = requests.get("https://api.dexscreener.com/latest/dex/tokens/"
+                             + self.SOL_MINT, timeout=10)
+            pairs = (r.json() or {}).get("pairs") or []
+            usd = max((float(p.get("priceUsd") or 0) for p in pairs), default=0.0)
+            if usd > 0:
+                self.sol_usd = usd
+            else:
+                ok = False
+        except Exception as e:  # noqa: BLE001
+            LOG.error("SOL price fetch failed: %s", e)
+            ok = False
+        try:
+            sol = self.live.sender.sol_balance(self.live.wallet.pubkey)
+            if self.sol_usd > 0:
+                self.cash = sol * self.sol_usd
+        except Exception as e:  # noqa: BLE001
+            LOG.error("wallet balance fetch failed: %s", e)
+            ok = False
+        return ok
 
     def buy(self, c: Candidate, usd: float, decimals: int = 9) -> Optional[Position]:
         res = self.live.buy(c.mint, usd / self._sol_price())
@@ -700,23 +758,35 @@ class LiveBrokerAdapter:
             entry_hourly_volume=c.volume_24h / 24,
             high_water_price=c.price_usd)
 
-    def sell(self, pos: Position, price: float, fraction: float, reason: str) -> float:
+    def sell(self, pos: Position, price: float, fraction: float,
+             reason: str) -> SellResult:
         if fraction >= 1.0:
             res = self.live.sell_all(pos.mint)
         else:
             res = self.live.sell(pos.mint, int(pos.qty * fraction * 10 ** pos.decimals))
         if not res.ok:
-            LOG.error("SELL FAILED %s — %s (position still open)", pos.symbol, res.error)
-            return 0.0
+            LOG.error("SELL FAILED %s — %s — POSITION STILL HELD, will retry",
+                      pos.symbol, res.error)
+            return SellResult(False, error=res.error)
         proceeds = res.out_amount / LAMPORTS_PER_SOL * self._sol_price()
         pos.qty -= pos.qty * fraction
         pos.realised_usd += proceeds
         LOG.info("SELL %-10s %.0f%% -> $%.2f — %s  sig=%s",
                  pos.symbol, fraction * 100, proceeds, reason, res.signature[:16])
-        return proceeds
+        return SellResult(True, proceeds)
 
 
 # ─────────────────────────── exit engine §6 ────────────────────────────────
+
+@dataclass
+class SellResult:
+    """Sells must report success. Returning a bare float made it impossible
+    to distinguish 'sold for $0' from 'the transaction failed', which let the
+    bot delete positions it still held."""
+    ok: bool
+    proceeds: float = 0.0
+    error: str = ""
+
 
 @dataclass
 class ExitSignal:
@@ -784,6 +854,12 @@ class CircuitBreakers:
         self.consecutive_losses = 0
         self.halted_until = 0.0
         self.hard_stopped = False
+        self.week_start_ts = time.time()
+        self.week_start_equity = cfg.capital_usd
+        self.last_feed_ts = 0.0
+
+    def mark_feed_fresh(self) -> None:
+        self.last_feed_ts = time.time()
 
     def record_close(self, pnl_usd: float) -> None:
         self.consecutive_losses = self.consecutive_losses + 1 if pnl_usd < 0 else 0
@@ -795,6 +871,21 @@ class CircuitBreakers:
         if self.hard_stopped:
             return False
         self.peak_equity = max(self.peak_equity, equity)
+
+        # §7.5 stale feed — halt entries if prices stopped updating
+        if self.last_feed_ts and \
+                time.time() - self.last_feed_ts > self.cfg.max_feed_staleness_sec:
+            LOG.warning("7.5 price feed stale %.0fs — entries blocked",
+                        time.time() - self.last_feed_ts)
+            return False
+
+        # §7.3 weekly drawdown
+        if time.time() - self.week_start_ts > 7 * 86400:
+            self.week_start_ts, self.week_start_equity = time.time(), equity
+        weekly = (equity / self.week_start_equity - 1) * 100 \
+            if self.week_start_equity else 0.0
+        if weekly <= self.cfg.weekly_drawdown_halt_pct:
+            self._halt(24 * 7, f"weekly drawdown {weekly:.1f}%")
 
         total_dd = (equity / self.peak_equity - 1) * 100
         if total_dd <= self.cfg.total_drawdown_stop_pct:
@@ -836,6 +927,8 @@ class Journal:
             price REAL, usd REAL, reason TEXT)""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS blacklist(
             mint TEXT PRIMARY KEY, reason TEXT, ts REAL)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS positions(
+            mint TEXT PRIMARY KEY, data TEXT, updated REAL)""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS observations(
             mint TEXT, ts REAL, holders INTEGER, liquidity REAL)""")
         self.db.execute("""CREATE INDEX IF NOT EXISTS obs_mint ON observations(mint, ts)""")
@@ -877,6 +970,23 @@ class Journal:
             return 0.0
         return max(0.0, (h1 - h0) / hours)
 
+    def save_positions(self, positions: dict) -> None:
+        self.db.execute("DELETE FROM positions")
+        for mint, p in positions.items():
+            self.db.execute("INSERT INTO positions VALUES (?,?,?)",
+                            (mint, json.dumps(asdict(p)), time.time()))
+        self.db.commit()
+
+    def load_positions(self) -> dict:
+        out = {}
+        try:
+            for mint, blob, _ in self.db.execute(
+                    "SELECT mint, data, updated FROM positions").fetchall():
+                out[mint] = Position(**json.loads(blob))
+        except Exception as e:  # noqa: BLE001
+            LOG.error("could not restore positions: %s", e)
+        return out
+
     def is_blacklisted(self, mint: str) -> bool:
         return self.db.execute(
             "SELECT 1 FROM blacklist WHERE mint=?", (mint,)).fetchone() is not None
@@ -900,17 +1010,32 @@ class Bot:
         self.broker = self._make_broker(cfg)
         self.breakers = CircuitBreakers(cfg)
         self.journal = Journal(cfg.db_path)
-        self.positions: dict[str, Position] = {}
+        self.positions: dict[str, Position] = self.journal.load_positions()
+        if self.positions:
+            LOG.warning("restored %d open position(s) from previous run: %s",
+                        len(self.positions),
+                        ", ".join(p.symbol for p in self.positions.values()))
+        self._reconcile_wallet()
+        if cfg.mode == "LIVE":
+            eq = self.equity()
+            self.breakers.day_start_equity = eq
+            self.breakers.peak_equity = eq
+            LOG.info("live equity at start: $%s", f"{eq:,.2f}")
 
     def _make_broker(self, cfg: Config):
         if cfg.mode == "PAPER":
             return PaperBroker(cfg)
         from execution import JupiterSwap, LiveBroker, Wallet
-        LOG.warning("LIVE MODE — real funds at risk on wallet %s",
-                    "…" )
-        return LiveBrokerAdapter(
-            LiveBroker(cfg.solana_rpc, Wallet(), JupiterSwap(),
+        w = Wallet()
+        LOG.warning("LIVE MODE — real funds at risk on wallet %s", w.pubkey)
+        adapter = LiveBrokerAdapter(
+            LiveBroker(cfg.solana_rpc, w, JupiterSwap(),
                        cfg.max_slippage_pct, cfg.max_exit_price_impact_pct))
+        if not adapter.refresh_state():
+            raise RuntimeError(
+                "could not read wallet balance or SOL price — refusing to "
+                "start live mode blind")
+        return adapter
 
     def holder_count(self, c: Candidate) -> int:
         """Best-effort holder count for the growth signal."""
@@ -920,6 +1045,39 @@ class Bot:
         return int(rep.get("totalHolders") or len(rep.get("topHolders") or []))
 
     # -- sizing §4 --------------------------------------------------------
+    def save_positions(self) -> None:
+        self.journal.save_positions(self.positions)
+
+    def _reconcile_wallet(self) -> None:
+        """Live mode: the wallet is the source of truth, not the database.
+
+        A crash between a buy confirming and the DB write leaves real tokens
+        the bot has no record of. Equally, a restored position may already
+        have been sold by hand. Reconcile before trading.
+        """
+        if self.cfg.mode != "LIVE" or not self.positions:
+            return
+        try:
+            sender = self.broker.live.sender
+            owner = self.broker.live.wallet.pubkey
+        except AttributeError:
+            return
+        for mint, pos in list(self.positions.items()):
+            try:
+                held = sender.token_balance_raw(owner, mint) / 10 ** pos.decimals
+            except Exception as e:  # noqa: BLE001
+                LOG.error("reconcile failed for %s: %s — keeping position", pos.symbol, e)
+                continue
+            if held <= 1e-9:
+                LOG.warning("%s: DB says %.4f held, wallet says 0 — dropping",
+                            pos.symbol, pos.qty)
+                del self.positions[mint]
+            elif abs(held - pos.qty) / max(pos.qty, 1e-9) > 0.02:
+                LOG.warning("%s: qty drift DB %.4f vs wallet %.4f — trusting wallet",
+                            pos.symbol, pos.qty, held)
+                pos.qty = held
+        self.save_positions()
+
     def position_size(self, c: Candidate) -> float:
         base = self.cfg.capital_usd * self.cfg.base_position_pct / 100
         cap = self.cfg.capital_usd * self.cfg.max_position_pct / 100
@@ -977,6 +1135,16 @@ class Bot:
                                   {"score": score, **parts})
             return
 
+        # Same coverage floor the analyzer applies. Without this the analyzer
+        # reports WATCH at 35% coverage while the bot buys the same token.
+        coverage = parts.get("_available_weight", 0.0)
+        if coverage < self.cfg.min_signal_coverage:
+            self.journal.decision(c.mint, c.symbol, "REJECT_COVERAGE",
+                                  {"score": score, "coverage": coverage})
+            LOG.info("SKIP   %-10s score %d but only %.0f%% signal coverage",
+                     c.symbol, score, coverage)
+            return
+
         if len(self.positions) >= self.cfg.max_concurrent_positions:
             return
         if self.deployed_usd() + size_usd > \
@@ -992,14 +1160,64 @@ class Bot:
 
         pos = self.broker.buy(fresh, size_usd, decimals)
         if pos:
+            try:
+                from safety_data import ReportView
+                rep0 = self.rugcheck.report(c.mint)
+                if rep0:
+                    t10, _ = ReportView(rep0).holder_concentration()
+                    pos.entry_top10 = t10 or 0.0
+            except Exception:  # noqa: BLE001
+                pass
             self.positions[pos.mint] = pos
+            self.save_positions()
             self.journal.trade(pos.mint, pos.symbol, "BUY",
                                pos.entry_price, size_usd, f"score={score}")
 
     # -- exit pipeline ----------------------------------------------------
+    def _insider_dump(self, pos: Position) -> bool:
+        """§6.3.2 — top holders offloading.
+
+        Compares current top-10 concentration against what it was at entry.
+        A sharp drop means large holders sold into the market. Previously this
+        parameter defaulted to False and nothing ever computed it, so the
+        emergency exit could never fire.
+        """
+        if not self.rugcheck or pos.chain != "solana":
+            return False
+        try:
+            from safety_data import ReportView
+            rep = self.rugcheck.report(pos.mint)
+            if not rep:
+                return False
+            top10, _ = ReportView(rep).holder_concentration()
+            if top10 is None:
+                return False
+            if pos.entry_top10 <= 0:
+                pos.entry_top10 = top10
+                return False
+            drop = pos.entry_top10 - top10
+            if drop >= self.cfg.insider_dump_drop_pct:
+                LOG.critical("%s: top-10 concentration fell %.1f%% -> %.1f%% "
+                             "(-%.1f pts) — insider distribution",
+                             pos.symbol, pos.entry_top10, top10, drop)
+                return True
+        except Exception as e:  # noqa: BLE001
+            LOG.debug("insider check failed: %s", e)
+        return False
+
+    def note_feed(self, ok: bool) -> None:
+        if ok:
+            self.breakers.mark_feed_fresh()
+
+    def refresh_broker(self) -> None:
+        if hasattr(self.broker, "refresh_state"):
+            self.broker.refresh_state()
+
     def manage_positions(self) -> None:
+        self.refresh_broker()
         for mint, pos in list(self.positions.items()):
             live = self.dex.pair(pos.chain, pos.pair_address)
+            self.note_feed(bool(live))
             if not live:
                 continue
             raw = int(pos.qty * 10 ** pos.decimals)
@@ -1008,19 +1226,40 @@ class Bot:
             authority_back = bool(info and (info.get("mintAuthority")
                                             or info.get("freezeAuthority")))
 
-            sig = evaluate_exits(pos, live, self.cfg, sell_ok, impact, authority_back)
+            insider_dump = self._insider_dump(pos)
+            sig = evaluate_exits(pos, live, self.cfg, sell_ok, impact,
+                                 authority_back, insider_dump)
             if not sig:
                 continue
 
             fraction = min(1.0, sig.fraction)
-            proceeds = self.broker.sell(pos, live.price_usd, fraction, sig.reason)
+            res = self.broker.sell(pos, live.price_usd, fraction, sig.reason)
+
+            if not res.ok:
+                # The position is STILL HELD. Do not forget it — the next loop
+                # re-evaluates and retries. Forgetting a position whose sell
+                # failed leaves real tokens unmonitored, which is exactly the
+                # scenario emergency exits exist for.
+                pos.failed_exits += 1
+                self.journal.decision(mint, pos.symbol, "SELL_FAILED",
+                                      {"reason": sig.reason, "error": res.error,
+                                       "attempts": pos.failed_exits})
+                if pos.failed_exits in (3, 10, 25):
+                    LOG.critical("%s: %d consecutive exit failures — MANUAL "
+                                 "INTERVENTION LIKELY NEEDED", pos.symbol,
+                                 pos.failed_exits)
+                self.save_positions()
+                continue
+
+            pos.failed_exits = 0
             self.journal.trade(mint, pos.symbol, "SELL",
-                               live.price_usd, proceeds, sig.reason)
+                               live.price_usd, res.proceeds, sig.reason)
             if pos.qty <= 1e-9 or fraction >= 1.0:
                 pnl = pos.realised_usd - pos.cost_usd
                 self.breakers.record_close(pnl)
                 LOG.info("CLOSED %-10s PnL $%+.2f", pos.symbol, pnl)
                 del self.positions[mint]
+            self.save_positions()
 
     # -- loop -------------------------------------------------------------
     def scan(self, queries: list[str]) -> list[Candidate]:

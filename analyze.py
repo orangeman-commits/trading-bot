@@ -51,7 +51,7 @@ def _obs_db():
 
 
 def record_and_measure_growth(mint: str, holders: int,
-                              liquidity: float) -> tuple[float, str]:
+                              liquidity: float) -> tuple[Optional[float], str]:
     """Persist this observation and return (holders_per_hour, note).
 
     Holder growth is a rate, so it needs two samples. The first analysis of a
@@ -70,18 +70,22 @@ def record_and_measure_growth(mint: str, holders: int,
 
         usable = [(t, h) for t, h in rows if h and h > 0]
         if not usable:
-            return 0.0, f"first observation ({holders:,} holders) — run again in 10+ min"
+            return None, f"first observation ({holders:,} holders) — run again in 10+ min"
         t0, h0 = usable[0]
         hours = (time.time() - t0) / 3600
         if hours < 0.17:
-            return 0.0, f"only {hours*60:.0f} min of history — need 10+ min"
+            return None, f"only {hours*60:.0f} min of history — need 10+ min"
         rate = (holders - h0) / hours
         span = f"{hours:.1f}h" if hours >= 1 else f"{hours*60:.0f}m"
-        return max(0.0, rate), (f"{rate:+.0f} holders/hr over {span} "
-                                f"({h0:,} → {holders:,})")
+        # Negative rates are returned as-is: losing holders is a real signal,
+        # not an absence of one.
+        note = f"{rate:+.0f} holders/hr over {span} ({h0:,} → {holders:,})"
+        if rate < 0:
+            note += "  ⚠ LOSING HOLDERS"
+        return rate, note
     except Exception as e:  # noqa: BLE001
         LOG.debug("growth tracking failed: %s", e)
-        return 0.0, "tracking unavailable"
+        return None, "tracking unavailable"
 
 # DexScreener chainId -> GoPlus chain id. GoPlus has no Robinhood Chain
 # support yet (launched 2026-07-01), so that entry is None and the screen
@@ -334,7 +338,7 @@ def analyze(token: str, chain: str = "solana", capital: float = 10_000.0,
     else:
         rep.gates_unknown.append(f"no safety adapter for chain '{c.chain}'")
 
-    growth, growth_note = 0.0, "not tracked on this chain"
+    growth, growth_note = None, "not tracked on this chain"
     if c.chain == "solana":
         try:
             from safety_data import RugCheck
