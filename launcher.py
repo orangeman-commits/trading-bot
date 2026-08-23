@@ -178,34 +178,61 @@ class App:
             return
 
         self.an_status.set(f"{r.symbol} on {r.chain}")
-        tone = {"ELIGIBLE": "good", "WATCH": "warn"}.get(r.verdict, "bad")
         self._w(f"{r.symbol}", "h1")
-        self._w(f"   {r.verdict}\n", tone)
-        self._w(f"{r.mint}\n", "muted")
-        self._w(f"{r.chain}  ·  {r.age_hours:.0f}h old\n\n", "muted")
+        self._w(f"   {r.mint[:16]}…  {r.chain}  ·  {r.age_hours:.0f}h old\n", "muted")
+
+        A = r.assess
+        if A:
+            def bar(score):
+                filled = int(round(score))
+                return "█" * filled + "·" * (10 - filled)
+            tone_of = lambda s: ("good" if s >= 7 else "warn" if s >= 4 else "bad")
+
+            self._w("\n")
+            for label, val, score in (
+                    ("SAFETY", A.safety, A.safety_score),
+                    ("LIQUIDITY", A.liquidity_grade, A.liquidity_score),
+                    ("MOMENTUM", A.momentum, A.momentum_score)):
+                self._w(f"{label:<11} ")
+                self._w(f"{val:<12} ", tone_of(score))
+                self._w(f"{bar(score)} {score:.1f}/10\n", "muted")
+            self._w(f"             {A.momentum_detail}\n", "muted")
+
+            self._w(f"\nENTRY STATUS ", "sect")
+            self._w(f"{A.entry_status:<12} ", tone_of(A.entry_score))
+            self._w(f"{bar(A.entry_score)} {A.entry_score:.1f}/10\n")
+            self._w(f"             {A.entry_reason}\n", "muted")
 
         # Market
-        self._w("MARKET\n", "sect")
+        self._w("\nMARKET\n", "sect")
         self._w(f"  price        ${r.price:.8g}\n")
         for label, v in (("1h", r.chg_1h), ("6h", r.chg_6h), ("24h", r.chg_24h)):
             self._w(f"  {label:<12} ")
             self._w(f"{v:+.1f}%\n", "good" if v >= 0 else "bad")
-        self._w(f"  liquidity    ${r.liquidity:,.0f}\n")
-        self._w(f"  volume 24h   ${r.volume_24h:,.0f}  ({r.vol_liq:.1f}x liq)\n")
+        gl = r.gecko
+        if gl and gl.total_liquidity > r.liquidity * 1.2:
+            self._w(f"  liquidity    ${gl.total_liquidity:,.0f} "
+                    f"across {gl.pool_count} pools\n")
+        else:
+            self._w(f"  liquidity    ${r.liquidity:,.0f}\n")
+        if gl and gl.total_liquidity > 0 and gl.total_volume > 0:
+            eff = gl.total_volume / gl.total_liquidity
+            self._w(f"  volume 24h   ${gl.total_volume:,.0f}  ({eff:.1f}x liq)\n")
+        else:
+            self._w(f"  volume 24h   ${r.volume_24h:,.0f}  ({r.vol_liq:.1f}x liq)\n")
         self._w(f"  fdv          ${r.fdv:,.0f}\n")
         bs = r.buys / max(r.sells, 1)
         self._w(f"  buys/sells   {r.buys:,} / {r.sells:,}  ({bs:.2f})\n",
                 "bad" if bs < 0.8 else "")
+        if A:
+            self._w(f"\n  {A.target_multiple:.0f}x target: FDV would need to reach "
+                    f"${A.target_fdv:,.0f}\n", "muted")
         if bs < 0.8:
             self._w("  ⚠ net distribution — sellers outnumber buyers\n", "bad")
         if r.chg_1h < 0 and r.chg_6h < 0 and r.chg_24h > 20:
             self._w("  ⚠ up on 24h but falling on 1h and 6h — move unwinding\n", "bad")
-        if r.vol_liq < 1.5:
-            self._w(f"  ⚠ vol/liq {r.vol_liq:.1f}x — thin, hard to exit\n", "warn")
-        elif r.vol_liq > 25:
-            self._w(f"  ⚠ vol/liq {r.vol_liq:.0f}x — possible wash trading\n", "bad")
 
-        # Sizing first: the actionable number
+        # Sizing
         S = r.sizing
         self._w("\nPOSITION SIZE\n", "sect")
         self._w(f"  ${S.recommended:,.0f}\n", "big")
@@ -230,7 +257,7 @@ class App:
         self._w(f"  R:R                     {L.rr_at_moderate:.1f}:1\n")
 
         # Gates
-        self._w(f"\nSAFETY  ({len(r.gates_passed)} passed, "
+        self._w(f"\nSAFETY GATES  ({len(r.gates_passed)} passed, "
                 f"{len(r.gates_failed)} failed, "
                 f"{len(r.gates_unknown)} unverified)\n", "sect")
         for g in r.gates_passed:
@@ -240,8 +267,8 @@ class App:
         for g in r.gates_unknown:
             self._w(f"  ? {g}\n", "muted")
 
-        avail = (r.score_parts or {}).get("_available_weight", 0)
         self._w(f"\nSCORE  {r.score}/100\n", "sect")
+        avail = (r.score_parts or {}).get("_available_weight", 0)
         self._w(f"  based on {avail:.0f}% of the full signal set\n",
                 "warn" if avail < 50 else "muted")
         for k, v in (r.score_parts or {}).items():
@@ -258,7 +285,7 @@ class App:
         self._w("\nLevels are arithmetic on observed structure, not forecasts.\n",
                 "muted")
 
-    # ── controls ───────────────────────────────────────────────────────
+    # ── controls ───────────────────────────────────────────────────────    # ── controls ───────────────────────────────────────────────────────
     def _tab_control(self, nb):
         f = ttk.Frame(nb)
         nb.add(f, text="Control")
