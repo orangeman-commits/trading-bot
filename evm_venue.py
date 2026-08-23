@@ -332,6 +332,17 @@ class GoPlusSecurity:
         except (TypeError, ValueError):
             out.append(("2.9_round_trip_tax", "UNKNOWN", "tax fields unparseable"))
 
+        # Proxy contracts: the implementation can be swapped after you buy,
+        # so today's audited bytecode is not a guarantee about tomorrow's.
+        # This field was previously ignored entirely on every EVM chain.
+        proxy = d.get("is_proxy")
+        out.append(("2.12_proxy_contract",
+                    "UNKNOWN" if proxy is None else
+                    ("PASS" if str(proxy) == "0" else "REJECT"),
+                    "not covered" if proxy is None else
+                    ("no proxy" if str(proxy) == "0" else
+                     "UPGRADEABLE — implementation can change after purchase")))
+
         src = d.get("is_open_source")
         out.append(("2.11_open_source",
                     "UNKNOWN" if src is None else
@@ -388,11 +399,30 @@ class GoPlusSecurity:
         lp = d.get("lp_holders")
         if lp is None:
             out.append(("2.3_lp_locked", "UNKNOWN", "lp_holders not covered"))
+        elif not lp:
+            out.append(("2.3_lp_locked", "UNKNOWN", "no lp holder data"))
         else:
-            locked = any(str(h.get("is_locked")) == "1" and
-                         float(h.get("percent") or 0) > 0.9 for h in lp)
-            out.append(("2.3_lp_locked", "PASS" if locked else "REJECT",
-                        f"{len(lp)} lp holders"))
+            # SUM the locked share. The previous version required a single
+            # holder above 90%, so a pool split across ten fully-locked
+            # holders failed the gate — a false rejection, not a real risk.
+            locked_pct, burned_pct = 0.0, 0.0
+            for h in lp:
+                try:
+                    pct = float(h.get("percent") or 0) * 100
+                except (TypeError, ValueError):
+                    continue
+                addr = str(h.get("address", "")).lower()
+                if addr in ("0x0000000000000000000000000000000000000000",
+                            "0x000000000000000000000000000000000000dead"):
+                    burned_pct += pct
+                elif str(h.get("is_locked")) == "1":
+                    locked_pct += pct
+            secured = locked_pct + burned_pct
+            out.append(("2.3_lp_locked",
+                        "PASS" if secured >= 90.0 else "REJECT",
+                        f"{secured:.1f}% secured "
+                        f"({locked_pct:.1f}% locked + {burned_pct:.1f}% burned) "
+                        f"across {len(lp)} holders"))
 
         return out
 

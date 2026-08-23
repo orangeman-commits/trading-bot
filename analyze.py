@@ -103,6 +103,23 @@ EVM_CHAIN_IDS = {
 # ────────────────────────────── model ──────────────────────────────────────
 
 @dataclass
+class GeckoData:
+    pool_count: int = 0
+    total_liquidity: float = 0.0
+    total_volume: float = 0.0
+    buyers: int = 0
+    sellers: int = 0
+    wallet_ratio: Optional[float] = None
+    repeat_buy_skew: Optional[float] = None
+    buys_per_buyer: Optional[float] = None
+    unique_traders: int = 0
+    true_low_24h: Optional[float] = None
+    true_high_24h: Optional[float] = None
+    candles_used: int = 0
+    note: str = ""
+
+
+@dataclass
 class Levels:
     price: float
     base: float                    # approximate swing low of the observed move
@@ -153,6 +170,8 @@ class Report:
     attention: Optional[dict] = None
     holder_count: int = 0
     growth_note: str = ""
+    gecko: Optional[GeckoData] = None
+    depth_used: float = 0.0
 
 
 # ──────────────────────────── level math ───────────────────────────────────
@@ -184,8 +203,15 @@ def reconstruct_base(price: float, chg_1h: float, chg_6h: float,
 
 
 def compute_levels(price: float, chg_1h: float, chg_6h: float, chg_24h: float,
-                   hard_stop_pct: float = -35.0) -> Levels:
-    base, window = reconstruct_base(price, chg_1h, chg_6h, chg_24h)
+                   hard_stop_pct: float = -35.0,
+                   true_low: Optional[float] = None) -> Levels:
+    if true_low and 0 < true_low < price:
+        # Real traded low from candles. Strictly better than reconstruction,
+        # which is blind to intra-period wicks and typically sits well above
+        # the actual low — putting stops inside the day's real range.
+        base, window = true_low, "24h candle low"
+    else:
+        base, window = reconstruct_base(price, chg_1h, chg_6h, chg_24h)
     swing = max(price - base, price * 1e-9)
     move_pct = (price / base - 1) * 100 if base > 0 else 0.0
 
@@ -288,14 +314,83 @@ def analyze(token: str, chain: str = "solana", capital: float = 10_000.0,
         chg_1h=chg("h1") or 0.0, chg_6h=chg("h6") or 0.0,
         chg_24h=chg("h24") or 0.0, attention=sentiment)
 
+    # ── GeckoTerminal: real candles, all pools, dollar flow ────────────
+    gd = None
+    try:
+        from gecko import GeckoTerminal
+        gt = GeckoTerminal()
+        agg = gt.aggregate(c.chain, c.mint)
+        if agg:
+            f = agg["flow"]
+            gd = GeckoData(
+                pool_count=agg["pool_count"],
+                total_liquidity=agg["total_liquidity"],
+                total_volume=agg["total_volume_24h"],
+                buyers=f.buyers, sellers=f.sellers,
+                wallet_ratio=f.wallet_ratio,
+                repeat_buy_skew=f.repeat_buy_skew,
+                buys_per_buyer=f.buys_per_buyer,
+                unique_traders=f.unique_traders)
+            candles = gt.ohlcv(c.chain, agg["primary_pool"].address, "hour", 1, 168)
+            sw = gt.swing_low(candles, 24)
+            if sw:
+                gd.true_low_24h, gd.true_high_24h, gd.candles_used = sw
+            else:
+                gd.note = "no candle data"
+        else:
+            gd = GeckoData(note="token not indexed by GeckoTerminal")
+    except Exception as e:  # noqa: BLE001
+        gd = GeckoData(note=f"unavailable: {e}")
+    rep.gecko = gd
+
     rep.levels = compute_levels(c.price_usd, rep.chg_1h, rep.chg_6h, rep.chg_24h,
-                                cfg.hard_stop_pct)
+                                cfg.hard_stop_pct,
+                                true_low=gd.true_low_24h if gd else None)
+    # Exit capacity spans every pool a router can split across, not just the
+    # deepest one. Falls back to the single-pool figure when unavailable.
+    depth = (gd.total_liquidity if gd and gd.total_liquidity > c.liquidity_usd
+             else c.liquidity_usd)
     rep.sizing = compute_sizing(
-        capital, c.liquidity_usd, rep.levels.stop_pct,
+        capital, depth, rep.levels.stop_pct,
         partial_coverage=c.chain in cfg.partial_coverage_chains)
+    rep.depth_used = depth
 
     # Discovery + safety gates
     for g in discovery_filters(c, cfg):
+        # Gate 1.7 counts transactions and cannot tell manufactured volume
+        # (many tiny buys, no net dollars) from real accumulation (many buys
+        # AND real dollars in). When GeckoTerminal gives us flow, use it.
+        if g.name == "1.5_vol_liq_ratio" and gd and gd.total_liquidity > 0 \
+                and gd.total_volume > 0:
+            # DexScreener reports ONE pool. A token trading across 20 pools
+            # has its real ratio computed from aggregate depth and volume;
+            # gating on the fragment produced a 0.4x reading where the true
+            # figure was 1.13x.
+            agg_ratio = gd.total_volume / gd.total_liquidity
+            detail = (f"{agg_ratio:.2f}x across {gd.pool_count} pools "
+                      f"(single-pool view said {c.vol_liq_ratio:.2f}x)")
+            if cfg.min_vol_liq_ratio <= agg_ratio <= cfg.max_vol_liq_ratio:
+                rep.gates_passed.append(f"1.5_vol_liq_ratio = {detail}")
+            else:
+                rep.gates_failed.append(f"1.5_vol_liq_ratio = {detail}")
+            continue
+
+        if g.name == "1.7_buy_sell_ratio" and gd and gd.wallet_ratio is not None:
+            # Judge on UNIQUE WALLETS, not transaction counts. A handful of
+            # wallets making repeat buys inflates the txn ratio without
+            # representing real demand.
+            wr, skew = gd.wallet_ratio, gd.repeat_buy_skew
+            detail = (f"txn {g.detail} but wallets {wr:.2f} "
+                      f"({gd.buyers:,} buyers / {gd.sellers:,} sellers)")
+            if skew and skew >= cfg.max_repeat_buy_skew:
+                rep.gates_failed.append(
+                    f"1.7_wallet_ratio = {detail}, repeat-buy skew {skew:.1f}x "
+                    f"— {gd.buys_per_buyer:.1f} buys per buyer, manufactured")
+            elif cfg.min_buy_sell_ratio <= wr <= cfg.max_buy_sell_ratio:
+                rep.gates_passed.append(f"1.7_wallet_ratio = {detail}")
+            else:
+                rep.gates_failed.append(f"1.7_wallet_ratio = {detail}")
+            continue
         if g.ok:
             rep.gates_passed.append(f"{g.name} = {g.detail}")
         else:
@@ -361,8 +456,16 @@ def analyze(token: str, chain: str = "solana", capital: float = 10_000.0,
             growth_note = f"tracking error: {e}"
     rep.growth_note = growth_note
 
+    # Score on aggregate depth and volume. Scoring volume_quality off the
+    # single-pool ratio gave PONS 0.1/15 on a 0.42x reading when the real
+    # figure across 20 pools was 1.13x.
+    scored = c
+    if gd and gd.total_liquidity > c.liquidity_usd and gd.total_volume > 0:
+        from dataclasses import replace as _replace
+        scored = _replace(c, liquidity_usd=gd.total_liquidity,
+                          volume_24h=gd.total_volume)
     rep.score, rep.score_parts = Scorer(cfg).score(
-        c, holder_growth_per_hr=growth, sentiment=sentiment)
+        scored, holder_growth_per_hr=growth, sentiment=sentiment)
 
     # Verdict
     partial = c.chain in cfg.partial_coverage_chains
@@ -431,8 +534,14 @@ def render(r: Report) -> str:
         "",
         f"price      ${r.price:.8g}   "
         f"1h {r.chg_1h:+.1f}%  6h {r.chg_6h:+.1f}%  24h {r.chg_24h:+.1f}%",
-        f"liquidity  ${r.liquidity:,.0f}",
-        f"volume 24h ${r.volume_24h:,.0f}   (vol/liq {r.vol_liq:.1f}x)",
+        (f"liquidity  ${r.gecko.total_liquidity:,.0f} across {r.gecko.pool_count} pools"
+         if r.gecko and r.gecko.total_liquidity > r.liquidity * 1.2
+         else f"liquidity  ${r.liquidity:,.0f}"),
+        (f"volume 24h ${r.gecko.total_volume:,.0f}   "
+         f"(vol/liq {r.gecko.total_volume/r.gecko.total_liquidity:.1f}x, "
+         f"{r.gecko.pool_count} pools)"
+         if r.gecko and r.gecko.total_liquidity > 0 and r.gecko.total_volume > 0
+         else f"volume 24h ${r.volume_24h:,.0f}   (vol/liq {r.vol_liq:.1f}x)"),
         f"fdv        ${r.fdv:,.0f}",
         f"age        {r.age_hours:.1f}h   buys/sells {r.buys}/{r.sells}",
     ]
@@ -445,10 +554,13 @@ def render(r: Report) -> str:
         out.append(f"           ⚠ up on 24h but falling on 1h and 6h — "
                    f"the move is unwinding")
 
-    if r.vol_liq > 25:
-        out.append(f"           ⚠ vol/liq {r.vol_liq:.0f}x suggests wash trading")
-    elif r.vol_liq < 1.5:
-        out.append(f"           ⚠ vol/liq {r.vol_liq:.1f}x — thin, hard to exit")
+    eff_vl = r.vol_liq
+    if r.gecko and r.gecko.total_liquidity > 0 and r.gecko.total_volume > 0:
+        eff_vl = r.gecko.total_volume / r.gecko.total_liquidity
+    if eff_vl > 25:
+        out.append(f"           ⚠ vol/liq {eff_vl:.0f}x suggests wash trading")
+    elif eff_vl < 1.5:
+        out.append(f"           ⚠ vol/liq {eff_vl:.1f}x — thin, hard to exit")
 
     out += ["", "LEVELS", f"  base       ${L.base:.8g}  ({L.stop_basis})",
             f"  move       +{L.move_pct:.0f}% off base"]
@@ -467,8 +579,37 @@ def render(r: Report) -> str:
         f"    liquidity cap    ${S.max_by_liquidity:,.0f}",
         f"    position cap     ${S.max_by_rule:,.0f}",
     ]
+    if r.depth_used > r.liquidity * 1.2:
+        out.append(f"  liquidity cap from ${r.depth_used:,.0f} aggregate depth, "
+                   f"not the ${r.liquidity:,.0f} single-pool figure")
     if S.exit_impact_pct is not None:
         out.append(f"  exit impact  {S.exit_impact_pct:.2f}% at that size")
+
+    g = r.gecko
+    if g and (g.pool_count or g.note):
+        out += ["", "GECKOTERMINAL"]
+        if g.pool_count:
+            out.append(f"  pools        {g.pool_count}  "
+                       f"(total liq ${g.total_liquidity:,.0f})")
+            if r.liquidity > 0 and g.total_liquidity > r.liquidity * 1.2:
+                out.append(f"  ⚠ DexScreener shows ${r.liquidity:,.0f} — "
+                           f"single pool, understates depth")
+            out.append(f"  volume 24h   ${g.total_volume:,.0f} across all pools")
+            if g.wallet_ratio is not None:
+                out.append(f"  wallets      {g.buyers:,} buyers / "
+                           f"{g.sellers:,} sellers  (ratio {g.wallet_ratio:.2f})")
+            if g.repeat_buy_skew:
+                tag = ("normal" if g.repeat_buy_skew < 2 else
+                       "elevated" if g.repeat_buy_skew < 4 else "MANUFACTURED")
+                out.append(f"  repeat-buy   {g.buys_per_buyer:.1f} buys/buyer, "
+                           f"skew {g.repeat_buy_skew:.1f}x — {tag}")
+        if g.true_low_24h:
+            rng = (g.true_high_24h / g.true_low_24h - 1) * 100
+            out.append(f"  24h true low  ${g.true_low_24h:.8g}")
+            out.append(f"  24h true high ${g.true_high_24h:.8g}   "
+                       f"(range {rng:.0f}%, {g.candles_used} candles)")
+        if g.note:
+            out.append(f"  {g.note}")
 
     if r.holder_count:
         out += ["", f"HOLDERS  {r.holder_count:,}", f"  {r.growth_note}"]
@@ -493,8 +634,9 @@ def render(r: Report) -> str:
         out += ["", "UNVERIFIABLE"] + [f"  ? {g}" for g in r.gates_unknown]
 
     out += ["", "NOTES"] + [f"  • {x}" for x in r.reasons]
-    out += ["",
-            "Levels are arithmetic on observed structure, not forecasts.",
+    used_candles = bool(r.gecko and r.gecko.true_low_24h)
+    out += ["", "Levels are arithmetic on observed structure, not forecasts.",
+            "Base from real candle lows (GeckoTerminal)." if used_candles else
             "Reconstructed from 1h/6h/24h endpoints — intra-period lows are invisible."]
     return "\n".join(out)
 

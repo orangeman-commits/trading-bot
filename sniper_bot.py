@@ -90,6 +90,12 @@ class Config:
     max_vol_liq_ratio: float = 25.0
     min_unique_traders_24h: int = 250
     min_buy_sell_ratio: float = 0.8
+    # Repeat-buy skew = (buys per unique buyer) / (sells per unique seller).
+    # ~1 is normal. High values mean a few wallets are generating the buy
+    # count. GeckoTerminal's public API does not expose buy/sell dollar
+    # volume, so unique-wallet behaviour is the available substitute — and a
+    # better one than transaction counts.
+    max_repeat_buy_skew: float = 3.0
     max_buy_sell_ratio: float = 3.0
     allowed_quotes: tuple = ("SOL", "WETH", "ETH", "USDC", "USDT", "WSOL")
     # Chains where non-crypto quote assets are normal rather than suspicious.
