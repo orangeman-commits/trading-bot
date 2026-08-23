@@ -97,6 +97,7 @@ class Config:
     min_lp_burned_pct: float = 90.0
     max_top10_pct: float = 25.0
     max_single_holder_pct: float = 8.0
+    max_insider_pct: float = 15.0
     max_deployer_pct: float = 5.0
     max_round_trip_tax_pct: float = 5.0
     max_exit_price_impact_pct: float = 4.0
@@ -388,7 +389,7 @@ class SafetyScreen:
             Verdict.PASS if info.get("freezeAuthority") is None else Verdict.REJECT,
             str(info.get("freezeAuthority"))))
 
-        # 2.4 / 2.5 — holder concentration
+        # 2.4 / 2.5 — holder concentration (from the RugCheck report)
         results.extend(self._concentration_gates(cand, info))
 
         # 2.8 / 2.10 — full-size sell simulation
@@ -454,6 +455,33 @@ class SafetyScreen:
         return out
 
     def _concentration_gates(self, cand: Candidate, info: dict) -> list[GateResult]:
+        # Prefer RugCheck: the report is already fetched, carries owner and
+        # insider labels, and costs zero extra RPC calls. The RPC path below
+        # needs ~21 requests per token and the public endpoint throttles it
+        # into failure, which is why this gate read UNKNOWN on every token.
+        if self.rugcheck:
+            from safety_data import ReportView
+            rep = self.rugcheck.report(cand.mint)
+            if rep:
+                v = ReportView(rep)
+                top10, largest = v.holder_concentration()
+                if top10 is not None:
+                    out = [
+                        GateResult("2.4_top10_concentration",
+                                   Verdict.PASS if top10 < self.cfg.max_top10_pct
+                                   else Verdict.REJECT, f"{top10:.1f}%"),
+                        GateResult("2.5_largest_holder",
+                                   Verdict.PASS if largest < self.cfg.max_single_holder_pct
+                                   else Verdict.REJECT, f"{largest:.1f}%"),
+                    ]
+                    ins = v.insider_pct()
+                    if ins > 0:
+                        out.append(GateResult(
+                            "2.7_insider_holdings",
+                            Verdict.PASS if ins < self.cfg.max_insider_pct
+                            else Verdict.REJECT, f"{ins:.1f}%"))
+                    return out
+
         holders = self.rpc.largest_holders(cand.mint)
         if not holders:
             return [GateResult("2.4_top10_concentration", Verdict.UNKNOWN,

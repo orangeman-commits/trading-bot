@@ -21,6 +21,11 @@ import requests
 
 LOG = logging.getLogger("safety")
 
+BURN_ADDRESSES = {
+    "1nc1nerator11111111111111111111111111111111",
+    "11111111111111111111111111111111",
+}
+
 
 class RugCheck:
     BASE = "https://api.rugcheck.xyz/v1"
@@ -110,13 +115,46 @@ class ReportView:
         return _num(lp.get("baseUSD")) + _num(lp.get("quoteUSD"))
 
     # -- gates 2.4 / 2.5 --------------------------------------------------
+    # RugCheck labels addresses it recognises. AMM vaults, LP accounts and
+    # burn addresses are not whales — counting them inflates concentration and
+    # rejects healthy tokens.
+    NON_WHALE_LABELS = ("amm", "lp", "burn", "market", "pool", "vault",
+                        "raydium", "orca", "meteora", "pump")
+
+    def _known_accounts(self) -> dict:
+        ka = self.r.get("knownAccounts")
+        return ka if isinstance(ka, dict) else {}
+
+    def _is_non_whale(self, address: str, owner: str) -> bool:
+        known = self._known_accounts()
+        for addr in (address, owner):
+            if not addr:
+                continue
+            if addr in BURN_ADDRESSES:
+                return True
+            entry = known.get(addr)
+            if isinstance(entry, dict):
+                blob = f"{entry.get('name','')} {entry.get('type','')}".lower()
+                if any(k in blob for k in self.NON_WHALE_LABELS):
+                    return True
+        return False
+
     def holder_concentration(self) -> tuple[Optional[float], Optional[float]]:
-        holders = self.r.get("topHolders") or []
-        if not holders:
+        """Top-10 and largest holder percentages, excluding pools and burns.
+
+        Source is the RugCheck report already in hand. The previous
+        implementation called getTokenLargestAccounts plus one getAccountInfo
+        per holder — roughly 21 RPC calls per token, which the public Solana
+        endpoint rate-limits into returning nothing at all.
+        """
+        holders = self.r.get("topHolders")
+        if not isinstance(holders, list) or not holders:
             return None, None
         pcts = []
         for h in holders:
-            if h.get("insider") is True and h.get("owner") in (None, ""):
+            if not isinstance(h, dict):
+                continue
+            if self._is_non_whale(h.get("address", ""), h.get("owner", "")):
                 continue
             pct = _num(h.get("pct"), -1)
             if pct >= 0:
@@ -125,6 +163,14 @@ class ReportView:
             return None, None
         pcts.sort(reverse=True)
         return sum(pcts[:10]), pcts[0]
+
+    def insider_pct(self) -> float:
+        """Share held by wallets RugCheck flags as insiders."""
+        total = 0.0
+        for h in (self.r.get("topHolders") or []):
+            if isinstance(h, dict) and h.get("insider") is True:
+                total += _num(h.get("pct"))
+        return total
 
     # -- gate 2.6 ---------------------------------------------------------
     def creator_pct(self) -> Optional[float]:
@@ -191,6 +237,7 @@ def verify_schema(mint: str) -> None:
     print(f"risk_score     : {v.risk_score()}  (0-100, higher is worse)")
     print(f"blocking risks : {v.blocking_risks()}")
     print(f"top10 / largest: {top10} / {largest}")
+    print(f"insider pct    : {v.insider_pct():.2f}%")
     print(f"creator_pct    : {v.creator_pct()}")
     print(f"transfer_fee   : {v.transfer_fee_pct()}")
     print(f"authorities_ok : {v.authorities_clear()}")
