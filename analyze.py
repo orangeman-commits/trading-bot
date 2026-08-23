@@ -103,6 +103,34 @@ EVM_CHAIN_IDS = {
 # ────────────────────────────── model ──────────────────────────────────────
 
 @dataclass
+class Assessment:
+    """Separates 'allowed by the rules' from 'good entry right now'.
+
+    ELIGIBLE previously meant both, which is why a token up 1122% with no
+    defensible stop could read as a green light. Safety and entry timing are
+    different questions and now get different answers.
+
+    Every field below is a reading of PRESENT structure — extension off the
+    base, momentum alignment across timeframes, whether a stop can be placed.
+    None of it forecasts direction.
+    """
+    safety: str = "UNKNOWN"          # STRONG / ADEQUATE / WEAK / BLOCKED
+    safety_score: float = 0.0        # /10
+    liquidity_grade: str = ""
+    liquidity_score: float = 0.0     # /10
+    momentum: str = ""
+    momentum_detail: str = ""
+    momentum_score: float = 0.0      # /10
+    entry_status: str = "WAIT"       # READY / WAIT / EXTENDED / REVERSING / FALLING / BLOCKED
+    entry_score: float = 0.0         # /10
+    entry_reason: str = ""
+    extension_pct: float = 0.0
+    stop_viable: bool = True
+    target_fdv: float = 0.0
+    target_multiple: float = 2.0
+
+
+@dataclass
 class GeckoData:
     pool_count: int = 0
     total_liquidity: float = 0.0
@@ -172,6 +200,7 @@ class Report:
     growth_note: str = ""
     gecko: Optional[GeckoData] = None
     depth_used: float = 0.0
+    assess: Optional[Assessment] = None
 
 
 # ──────────────────────────── level math ───────────────────────────────────
@@ -280,6 +309,110 @@ def compute_sizing(capital: float, liquidity: float, stop_pct: float,
     s.binding_constraint = min(options, key=lambda k: options[k])
     s.recommended = max(0.0, options[s.binding_constraint])
     return s
+
+
+def assess(rep: "Report", cfg) -> Assessment:
+    """Grade safety, liquidity, momentum and entry timing separately."""
+    a = Assessment(target_multiple=2.0)
+    L = rep.levels
+
+    # ── safety ──────────────────────────────────────────────────────
+    total = len(rep.gates_passed) + len(rep.gates_failed) + len(rep.gates_unknown)
+    passed = len(rep.gates_passed)
+    if rep.gates_failed:
+        a.safety, a.safety_score = "BLOCKED", 0.0
+    elif rep.gates_unknown:
+        a.safety = "PARTIAL"
+        a.safety_score = round(passed / max(total, 1) * 10, 1)
+    else:
+        a.safety = "STRONG"
+        a.safety_score = 10.0
+
+    # ── liquidity / exit ability ────────────────────────────────────
+    depth = rep.depth_used or rep.liquidity
+    impact = rep.sizing.exit_impact_pct if rep.sizing else None
+    if depth >= 1_000_000:
+        a.liquidity_grade, a.liquidity_score = "EXCELLENT", 9.0
+    elif depth >= 300_000:
+        a.liquidity_grade, a.liquidity_score = "GOOD", 7.0
+    elif depth >= 100_000:
+        a.liquidity_grade, a.liquidity_score = "ADEQUATE", 5.0
+    else:
+        a.liquidity_grade, a.liquidity_score = "THIN", 2.0
+    if impact is not None:
+        if impact < 1:
+            a.liquidity_score = min(10.0, a.liquidity_score + 1)
+        elif impact > 4:
+            a.liquidity_score = max(1.0, a.liquidity_score - 3)
+
+    # ── momentum ────────────────────────────────────────────────────
+    h1, h6, h24 = rep.chg_1h, rep.chg_6h, rep.chg_24h
+    if h24 > 100 and h1 < 0 and h6 < 0:
+        a.momentum = "REVERSING"
+        a.momentum_detail = "very strong 24h, both 1h and 6h negative"
+        a.momentum_score = 3.0
+    elif h24 > 20 and h1 < 0 and h6 < 0:
+        a.momentum = "WEAKENING"
+        a.momentum_detail = "24h positive, short timeframes rolling over"
+        a.momentum_score = 4.0
+    elif h1 > 0 and h6 > 0 and h24 > 0:
+        a.momentum = "ALIGNED"
+        a.momentum_detail = "positive across 1h, 6h and 24h"
+        a.momentum_score = 8.0
+    elif h24 > 0 and abs(h6) < 5 and h1 > 0:
+        a.momentum = "CONSOLIDATING"
+        a.momentum_detail = "digesting the move, 1h turning up"
+        a.momentum_score = 7.0
+    elif h1 < 0 and h6 < 0 and h24 < 0:
+        a.momentum = "FALLING"
+        a.momentum_detail = "negative across all timeframes"
+        a.momentum_score = 1.0
+    else:
+        a.momentum = "MIXED"
+        a.momentum_detail = f"1h {h1:+.1f}%, 6h {h6:+.1f}%, 24h {h24:+.1f}%"
+        a.momentum_score = 5.0
+
+    # ── entry timing ────────────────────────────────────────────────
+    a.extension_pct = L.move_pct if L else 0.0
+    a.stop_viable = bool(L and "rulebook cap" not in (L.stop_basis or ""))
+    a.target_fdv = rep.fdv * a.target_multiple
+
+    if rep.gates_failed:
+        a.entry_status, a.entry_score = "BLOCKED", 0.0
+        a.entry_reason = "safety gates failed — nothing else matters"
+    elif not a.stop_viable:
+        a.entry_status, a.entry_score = "EXTENDED", 1.0
+        a.entry_reason = (
+            f"up {a.extension_pct:.0f}% off the base with no defensible stop — "
+            f"structural stop would be far wider than the risk limit allows")
+    elif a.momentum == "REVERSING":
+        a.entry_status, a.entry_score = "REVERSING", 2.0
+        a.entry_reason = (
+            f"up {a.extension_pct:.0f}% on 24h but both 1h and 6h are "
+            f"negative — the move is unwinding, not pausing")
+    elif a.momentum == "FALLING":
+        a.entry_status, a.entry_score = "FALLING", 2.0
+        a.entry_reason = "negative across every timeframe — no basis for entry"
+    elif a.extension_pct > 200:
+        a.entry_status, a.entry_score = "EXTENDED", 3.0
+        a.entry_reason = (
+            f"up {a.extension_pct:.0f}% off the base — a {a.target_multiple:.0f}x "
+            f"from here needs ${a.target_fdv:,.0f} FDV")
+    elif a.extension_pct > 60:
+        a.entry_status, a.entry_score = "WAIT", 4.5
+        a.entry_reason = (
+            f"up {a.extension_pct:.0f}% — wait for a pullback toward the "
+            f"retracement zone rather than chasing")
+    elif a.momentum in ("ALIGNED", "CONSOLIDATING"):
+        a.entry_status, a.entry_score = "READY", 8.0
+        a.entry_reason = (
+            f"only {a.extension_pct:.0f}% off the base, momentum {a.momentum.lower()}, "
+            f"defensible stop at {L.stop_pct:.0f}%")
+    else:
+        a.entry_status, a.entry_score = "WAIT", 5.0
+        a.entry_reason = f"momentum {a.momentum.lower()}, no clear trigger"
+
+    return a
 
 
 # ────────────────────────────── analysis ───────────────────────────────────
@@ -486,7 +619,7 @@ def analyze(token: str, chain: str = "solana", capital: float = 10_000.0,
             f"(§0b) — you cannot prove this token is sellable or that its LP "
             f"is locked. Position halved per §4.8")
     elif rep.score < cfg.min_score:
-        rep.verdict = "WATCH"
+        rep.verdict = "BELOW SCORE"
         rep.reasons.append(f"score {rep.score} below threshold {cfg.min_score}")
     elif rep.score_parts.get("_available_weight", 0) < 50:
         # Never call something ELIGIBLE on a partial picture. With no cohort
@@ -498,8 +631,10 @@ def analyze(token: str, chain: str = "solana", capital: float = 10_000.0,
             f"{rep.score_parts['_available_weight']:.0f}% of signals measurable "
             f"— structural checks only, no smart-money or attention data")
     else:
-        rep.verdict = "ELIGIBLE"
-        rep.reasons.append(f"all gates passed, score {rep.score}")
+        rep.verdict = "PASSES SAFETY"
+        rep.reasons.append(
+            f"all gates passed, score {rep.score} — this is a SAFETY verdict. "
+            f"See ENTRY STATUS for whether now is a reasonable moment.")
 
     if rep.levels.move_pct > 60:
         rep.reasons.append(
@@ -518,22 +653,50 @@ def analyze(token: str, chain: str = "solana", capital: float = 10_000.0,
 
     if not sentiment:
         rep.reasons.append("no attention data — social signal unmeasured, not absent")
+
+    rep.assess = assess(rep, cfg)
     return rep
 
 
 # ─────────────────────────────── output ────────────────────────────────────
 
-def render(r: Report) -> str:
-    L, S = r.levels, r.sizing
-    icon = {"ELIGIBLE": "●", "WATCH": "◐", "AVOID": "✕",
-            "INSUFFICIENT DATA": "?"}.get(r.verdict, "?")
+def _wrap(text: str, width: int) -> list:
+    words, lines, cur = (text or "").split(), [], ""
+    for w in words:
+        if len(cur) + len(w) + 1 > width:
+            lines.append(cur); cur = w
+        else:
+            cur = f"{cur} {w}".strip()
+    if cur:
+        lines.append(cur)
+    return lines or [""]
 
-    out = [
-        f"{icon}  {r.symbol}  —  {r.verdict}",
-        f"   {r.mint[:16]}…  ({r.chain})",
-        "",
-        f"price      ${r.price:.8g}   "
-        f"1h {r.chg_1h:+.1f}%  6h {r.chg_6h:+.1f}%  24h {r.chg_24h:+.1f}%",
+
+def render(r: Report) -> str:
+    L, S, A = r.levels, r.sizing, r.assess
+
+    def bar(score: float) -> str:
+        filled = int(round(score))
+        return "█" * filled + "·" * (10 - filled)
+
+    out = [f"{r.symbol}   {r.mint[:16]}…   {r.chain}  ·  {r.age_hours:.0f}h old", ""]
+
+    if A:
+        out += [
+            f"SAFETY        {A.safety:<12} {bar(A.safety_score)} {A.safety_score:.1f}/10",
+            f"LIQUIDITY     {A.liquidity_grade:<12} {bar(A.liquidity_score)} {A.liquidity_score:.1f}/10",
+            f"MOMENTUM      {A.momentum:<12} {bar(A.momentum_score)} {A.momentum_score:.1f}/10",
+            f"              {A.momentum_detail}",
+            "",
+            f"ENTRY STATUS  {A.entry_status:<12} {bar(A.entry_score)} {A.entry_score:.1f}/10",
+        ]
+        for line in _wrap(A.entry_reason, 60):
+            out.append(f"              {line}")
+        out.append("")
+
+    out += [
+        f"price      ${r.price:.8g}",
+        f"  1h {r.chg_1h:+.1f}%   6h {r.chg_6h:+.1f}%   24h {r.chg_24h:+.1f}%",
         (f"liquidity  ${r.gecko.total_liquidity:,.0f} across {r.gecko.pool_count} pools"
          if r.gecko and r.gecko.total_liquidity > r.liquidity * 1.2
          else f"liquidity  ${r.liquidity:,.0f}"),
@@ -543,24 +706,21 @@ def render(r: Report) -> str:
          if r.gecko and r.gecko.total_liquidity > 0 and r.gecko.total_volume > 0
          else f"volume 24h ${r.volume_24h:,.0f}   (vol/liq {r.vol_liq:.1f}x)"),
         f"fdv        ${r.fdv:,.0f}",
-        f"age        {r.age_hours:.1f}h   buys/sells {r.buys}/{r.sells}",
+        f"buys/sells {r.buys:,} / {r.sells:,}  ({r.buys/max(r.sells,1):.2f})",
     ]
 
-    bs = r.buys / max(r.sells, 1)
-    if bs < 0.8:
-        out.append(f"           ⚠ {r.sells:,} sells vs {r.buys:,} buys "
-                   f"({bs:.2f}) — net distribution")
-    if r.chg_1h < 0 and r.chg_6h < 0 and r.chg_24h > 20:
-        out.append(f"           ⚠ up on 24h but falling on 1h and 6h — "
-                   f"the move is unwinding")
+    if A:
+        out += ["", f"{A.target_multiple:.0f}X TARGET",
+                f"  current fdv  ${r.fdv:,.0f}",
+                f"  {A.target_multiple:.0f}x fdv       ${A.target_fdv:,.0f}"]
 
     eff_vl = r.vol_liq
     if r.gecko and r.gecko.total_liquidity > 0 and r.gecko.total_volume > 0:
         eff_vl = r.gecko.total_volume / r.gecko.total_liquidity
     if eff_vl > 25:
-        out.append(f"           ⚠ vol/liq {eff_vl:.0f}x suggests wash trading")
+        out.append(f"  ⚠ vol/liq {eff_vl:.0f}x suggests wash trading")
     elif eff_vl < 1.5:
-        out.append(f"           ⚠ vol/liq {eff_vl:.1f}x — thin, hard to exit")
+        out.append(f"  ⚠ vol/liq {eff_vl:.1f}x — thin, hard to exit")
 
     out += ["", "LEVELS", f"  base       ${L.base:.8g}  ({L.stop_basis})",
             f"  move       +{L.move_pct:.0f}% off base"]

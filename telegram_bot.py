@@ -189,6 +189,14 @@ async def cmd_analyze(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not r:
             await update.message.reply_text("No pair found for that address.")
             return
+        if r.assess:
+            a = r.assess
+            await update.message.reply_text(
+                f"<b>{esc(r.symbol)}</b>\n"
+                f"safety   <b>{esc(a.safety)}</b> {a.safety_score:.0f}/10\n"
+                f"momentum <b>{esc(a.momentum)}</b> {a.momentum_score:.0f}/10\n"
+                f"entry    <b>{esc(a.entry_status)}</b> {a.entry_score:.0f}/10\n"
+                f"<i>{esc(a.entry_reason)}</i>", parse_mode=ParseMode.HTML)
         text = render(r)
         for i in range(0, len(text), 3500):
             await update.message.reply_text(

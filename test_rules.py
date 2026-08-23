@@ -5,6 +5,8 @@ from sniper_bot import (Config, Candidate, Position, evaluate_exits,
                         Scorer, CircuitBreakers, discovery_filters)
 
 CFG = Config()
+CFG.ratchet_enabled = False      # ladder tests below exercise the §6.1 path
+RATCHET = Config()               # ratchet defaults on
 
 
 def cand(price=1.0, liq=100_000, vol24=500_000, fdv=1_000_000,
@@ -107,6 +109,55 @@ results.append(check("-40% drawdown hard-stops", b2.hard_stopped, True))
 
 
 # ── regression tests for the audit fixes ──────────────────────────────────
+print("\n§6.1b ratcheting stop")
+_r = pos()
+# climb to +150%, then retrace: must exit at the locked level, not breakeven
+for _m in (1.5, 2.5):
+    evaluate_exits(_r, cand(price=_m), RATCHET, True, 1.0)
+_sig = evaluate_exits(_r, cand(price=1.9), RATCHET, True, 1.0)
+results.append(check("retrace from +150% exits at locked level",
+                     bool(_sig and "ratchet" in _sig.reason), True))
+results.append(check("ratchet exit is a full exit",
+                     _sig.fraction if _sig else None, 1.0))
+
+_r2 = pos()
+evaluate_exits(_r2, cand(price=1.6), RATCHET, True, 1.0)   # peak +60%
+_sig2 = evaluate_exits(_r2, cand(price=1.34), RATCHET, True, 1.0)  # -40% giveback
+results.append(check("proportional giveback fires below next rung",
+                     bool(_sig2 and "ratchet" in _sig2.reason), True))
+
+_r3 = pos()
+_sig3 = evaluate_exits(_r3, cand(price=3.1), RATCHET, True, 1.0)
+results.append(check("3x target exits", bool(_sig3 and "target" in _sig3.reason), True))
+
+_r4 = pos()
+results.append(check("healthy climb does not exit early",
+                     evaluate_exits(_r4, cand(price=1.15), RATCHET, True, 1.0), None))
+
+print("\n§ entry status vs safety")
+from analyze import assess, Report, compute_levels, compute_sizing
+def _mk(h1, h6, h24, price, failed=None):
+    L = compute_levels(price, h1, h6, h24, CFG.hard_stop_pct)
+    S = compute_sizing(1000, 2_000_000, L.stop_pct)
+    r = Report(symbol="T", mint="x"*44, chain="solana", price=price,
+               liquidity=2_000_000, fdv=2e7, volume_24h=6e6, vol_liq=3.0,
+               age_hours=180, buys=100, sells=80, chg_1h=h1, chg_6h=h6,
+               chg_24h=h24, levels=L, sizing=S, depth_used=2_000_000,
+               gates_passed=["a"]*20, gates_failed=failed or [])
+    return assess(r, CFG)
+
+results.append(check("extended + reversing -> not READY",
+                     _mk(-4, -3.5, 909, 0.029).entry_status in
+                     ("EXTENDED", "REVERSING"), True))
+results.append(check("modest move + aligned -> READY",
+                     _mk(2, 6, 28, 0.0042).entry_status, "READY"))
+results.append(check("failed gate -> entry BLOCKED",
+                     _mk(2, 6, 28, 0.0042, failed=["2.3_lp"]).entry_status, "BLOCKED"))
+results.append(check("safety strong can coexist with bad entry",
+                     (_mk(-4, -3.5, 909, 0.029).safety,
+                      _mk(-4, -3.5, 909, 0.029).entry_status == "READY"),
+                     ("STRONG", False)))
+
 print("\nAUDIT FIXES")
 import os, sqlite3
 from sniper_bot import (Journal, PaperBroker, SellResult, Scorer,
