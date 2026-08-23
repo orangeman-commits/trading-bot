@@ -36,6 +36,53 @@ from typing import Optional
 
 LOG = logging.getLogger("analyze")
 
+
+def _obs_db():
+    """Same store the engine uses, so CLI and app share observations."""
+    import sqlite3
+    from sniper_bot import app_data_dir
+    path = app_data_dir() / "bot_state.db"
+    db = sqlite3.connect(str(path))
+    db.execute("""CREATE TABLE IF NOT EXISTS observations(
+        mint TEXT, ts REAL, holders INTEGER, liquidity REAL)""")
+    db.execute("CREATE INDEX IF NOT EXISTS obs_mint ON observations(mint, ts)")
+    db.commit()
+    return db
+
+
+def record_and_measure_growth(mint: str, holders: int,
+                              liquidity: float) -> tuple[float, str]:
+    """Persist this observation and return (holders_per_hour, note).
+
+    Holder growth is a rate, so it needs two samples. The first analysis of a
+    token can only record; the second, ten or more minutes later, can measure.
+    This is real data rather than an API call — which is why it works without
+    any key, and why it cannot be conjured from a single run.
+    """
+    try:
+        db = _obs_db()
+        rows = db.execute(
+            "SELECT ts, holders FROM observations WHERE mint=? ORDER BY ts",
+            (mint,)).fetchall()
+        db.execute("INSERT INTO observations VALUES (?,?,?,?)",
+                   (mint, time.time(), holders, liquidity))
+        db.commit()
+
+        usable = [(t, h) for t, h in rows if h and h > 0]
+        if not usable:
+            return 0.0, f"first observation ({holders:,} holders) — run again in 10+ min"
+        t0, h0 = usable[0]
+        hours = (time.time() - t0) / 3600
+        if hours < 0.17:
+            return 0.0, f"only {hours*60:.0f} min of history — need 10+ min"
+        rate = (holders - h0) / hours
+        span = f"{hours:.1f}h" if hours >= 1 else f"{hours*60:.0f}m"
+        return max(0.0, rate), (f"{rate:+.0f} holders/hr over {span} "
+                                f"({h0:,} → {holders:,})")
+    except Exception as e:  # noqa: BLE001
+        LOG.debug("growth tracking failed: %s", e)
+        return 0.0, "tracking unavailable"
+
 # DexScreener chainId -> GoPlus chain id. GoPlus has no Robinhood Chain
 # support yet (launched 2026-07-01), so that entry is None and the screen
 # degrades to "unverifiable" rather than silently passing.
@@ -97,6 +144,8 @@ class Report:
     verdict: str = "UNKNOWN"
     reasons: list = field(default_factory=list)
     attention: Optional[dict] = None
+    holder_count: int = 0
+    growth_note: str = ""
 
 
 # ──────────────────────────── level math ───────────────────────────────────
@@ -285,7 +334,22 @@ def analyze(token: str, chain: str = "solana", capital: float = 10_000.0,
     else:
         rep.gates_unknown.append(f"no safety adapter for chain '{c.chain}'")
 
-    rep.score, rep.score_parts = Scorer(cfg).score(c, sentiment=sentiment)
+    growth, growth_note = 0.0, "not tracked on this chain"
+    if c.chain == "solana":
+        try:
+            from safety_data import RugCheck
+            rc_rep = RugCheck().report(c.mint)
+            total = int((rc_rep or {}).get("totalHolders") or 0)
+            if total > 0:
+                growth, growth_note = record_and_measure_growth(
+                    c.mint, total, c.liquidity_usd)
+                rep.holder_count = total
+        except Exception as e:  # noqa: BLE001
+            growth_note = f"tracking error: {e}"
+    rep.growth_note = growth_note
+
+    rep.score, rep.score_parts = Scorer(cfg).score(
+        c, holder_growth_per_hr=growth, sentiment=sentiment)
 
     # Verdict
     if rep.gates_failed:
@@ -375,6 +439,9 @@ def render(r: Report) -> str:
     ]
     if S.exit_impact_pct is not None:
         out.append(f"  exit impact  {S.exit_impact_pct:.2f}% at that size")
+
+    if r.holder_count:
+        out += ["", f"HOLDERS  {r.holder_count:,}", f"  {r.growth_note}"]
 
     avail = (r.score_parts or {}).get("_available_weight", 0)
     out += ["", f"SCORE  {r.score}/100   (from {avail:.0f}% of signal weight)"]
