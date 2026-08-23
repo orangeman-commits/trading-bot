@@ -98,6 +98,12 @@ class Config:
     # the venue, not a safety failure. It IS extra exposure — see the warning
     # emitted in analyze.py — but that belongs in scoring, not a hard gate.
     equity_quote_chains: tuple = ("robinhood", "robinhoodchain")
+    # §0b — chains where some §2 gates cannot be evaluated at all. UNKNOWN
+    # gates there do not hard-block, but position size is halved (§4.8) and
+    # every unverified gate is reported. This is an explicit, documented
+    # acceptance of worse information, not a claim that the tokens are safe.
+    partial_coverage_chains: tuple = ("robinhood", "robinhoodchain")
+    partial_coverage_size_mult: float = 0.5
 
     # -- §2 safety --------------------------------------------------------
     min_lp_burned_pct: float = 90.0
@@ -1094,7 +1100,10 @@ class Bot:
         base = self.cfg.capital_usd * self.cfg.base_position_pct / 100
         cap = self.cfg.capital_usd * self.cfg.max_position_pct / 100
         liq_cap = c.liquidity_usd * self.cfg.max_pct_of_liquidity / 100
-        return min(base, cap, liq_cap)
+        size = min(base, cap, liq_cap)
+        if c.chain in self.cfg.partial_coverage_chains:
+            size *= self.cfg.partial_coverage_size_mult   # §4.8
+        return size
 
     def deployed_usd(self) -> float:
         return sum(p.qty * p.entry_price for p in self.positions.values())

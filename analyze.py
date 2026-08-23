@@ -93,7 +93,10 @@ def record_and_measure_growth(mint: str, holders: int,
 EVM_CHAIN_IDS = {
     "base": 8453, "ethereum": 1, "arbitrum": 42161, "optimism": 10,
     "bsc": 56, "polygon": 137, "avalanche": 43114,
-    "robinhood": None, "robinhoodchain": None,
+    # Robinhood Chain (4663). GoPlus coverage is partial here — honeypot in
+    # particular comes back unknown — but tax, open-source and proxy do
+    # resolve, so mapping it to None discarded real data.
+    "robinhood": 4663, "robinhoodchain": 4663,
 }
 
 
@@ -227,11 +230,14 @@ def compute_levels(price: float, chg_1h: float, chg_6h: float, chg_24h: float,
 def compute_sizing(capital: float, liquidity: float, stop_pct: float,
                    risk_pct: float = 1.0, base_pos_pct: float = 2.0,
                    max_pos_pct: float = 3.0,
-                   max_liq_pct: float = 0.5) -> Sizing:
+                   max_liq_pct: float = 0.5,
+                   partial_coverage: bool = False) -> Sizing:
     """The output most signal posts omit entirely."""
     s = Sizing()
     s.max_by_liquidity = liquidity * max_liq_pct / 100
     s.max_by_rule = min(capital * base_pos_pct / 100, capital * max_pos_pct / 100)
+    if partial_coverage:
+        s.max_by_rule *= 0.5        # §4.8 — worse information, smaller bet
 
     # Risk-based: lose `risk_pct` of capital if the stop hits.
     if stop_pct < 0:
@@ -241,7 +247,8 @@ def compute_sizing(capital: float, liquidity: float, stop_pct: float,
 
     options = {
         "liquidity (§4.3 — exit capacity)": s.max_by_liquidity,
-        "position cap (§4.1/4.2)": s.max_by_rule,
+        ("position cap (§4.8 halved — partial coverage)" if partial_coverage
+         else "position cap (§4.1/4.2)"): s.max_by_rule,
         f"risk budget ({risk_pct}% of capital)": s.max_by_risk,
     }
     s.binding_constraint = min(options, key=lambda k: options[k])
@@ -283,7 +290,9 @@ def analyze(token: str, chain: str = "solana", capital: float = 10_000.0,
 
     rep.levels = compute_levels(c.price_usd, rep.chg_1h, rep.chg_6h, rep.chg_24h,
                                 cfg.hard_stop_pct)
-    rep.sizing = compute_sizing(capital, c.liquidity_usd, rep.levels.stop_pct)
+    rep.sizing = compute_sizing(
+        capital, c.liquidity_usd, rep.levels.stop_pct,
+        partial_coverage=c.chain in cfg.partial_coverage_chains)
 
     # Discovery + safety gates
     for g in discovery_filters(c, cfg):
@@ -356,13 +365,23 @@ def analyze(token: str, chain: str = "solana", capital: float = 10_000.0,
         c, holder_growth_per_hr=growth, sentiment=sentiment)
 
     # Verdict
+    partial = c.chain in cfg.partial_coverage_chains
+
     if rep.gates_failed:
         rep.verdict = "AVOID"
         rep.reasons.append(f"{len(rep.gates_failed)} hard gate(s) failed")
-    elif rep.gates_unknown:
+    elif rep.gates_unknown and not partial:
         rep.verdict = "INSUFFICIENT DATA"
         rep.reasons.append(f"{len(rep.gates_unknown)} gate(s) unverifiable — "
                            f"missing data counts as a rejection")
+    elif rep.gates_unknown and partial:
+        # §0b exception: this chain has no honeypot or LP-lock provider. The
+        # gates still cannot be evaluated — we are choosing to proceed without
+        # them, at half size, rather than pretending they passed.
+        rep.reasons.append(
+            f"{len(rep.gates_unknown)} gate(s) UNVERIFIABLE on {c.chain} "
+            f"(§0b) — you cannot prove this token is sellable or that its LP "
+            f"is locked. Position halved per §4.8")
     elif rep.score < cfg.min_score:
         rep.verdict = "WATCH"
         rep.reasons.append(f"score {rep.score} below threshold {cfg.min_score}")

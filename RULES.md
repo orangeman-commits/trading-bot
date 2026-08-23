@@ -11,16 +11,67 @@ never a pass.
 
 | Parameter | Value |
 |---|---|
-| Chains traded | Solana, Base |
-| Venues | On-chain AMMs only (Jupiter / Uniswap-v3 routers) |
-| Robinhood / Binance | **Not traded.** Custody of stables + majors only |
+| Chains traded | Solana, Base, Robinhood Chain |
+| Venues | On-chain AMMs (Jupiter on Solana, Uniswap V3/V4 on EVM) |
+| Robinhood Crypto (brokerage) | **Not traded.** Custody of stables + majors only |
 | Asset class | Newly launched low-cap tokens |
 | Mode | `PAPER` until 30 consecutive days of logged paper results exist |
 
-**Why the CEXs are excluded:** Robinhood lists a few dozen majors with no
-programmatic access suited to this strategy. Binance is curated — by the time a
-cashtag-driven token lists there, the move this bot hunts is already over.
-This strategy only exists where permissionless deployment exists.
+**Robinhood is two different things.** The *brokerage* (trading.robinhood.com)
+lists a few dozen majors and cannot trade new tokens — custody only. *Robinhood
+Chain* is a permissionless Arbitrum-Orbit L2, chain ID 4663, mainnet since
+2026-07-01, and is traded like any other EVM chain.
+
+Binance stays excluded: by the time a cashtag-driven token lists there, the
+move this bot hunts is over.
+
+---
+
+## 0b. Chain support matrix
+
+| | Solana | Base | Robinhood Chain |
+|---|---|---|---|
+| Chain id | — | 8453 | 4663 |
+| Router | Jupiter | Uniswap V3 | Uniswap V3 **and V4** |
+| Common quotes | SOL, USDC | WETH, USDC | WETH, USDG, **tokenised equities** |
+| Safety provider | RugCheck | GoPlus | GoPlus (partial) |
+| Honeypot check | Jupiter full-size sell sim | GoPlus | **unavailable** |
+| LP lock | RugCheck, primary pool | GoPlus | **unavailable** |
+| Holder concentration | RugCheck | GoPlus | GoPlus (partial) |
+| Proxy contract | n/a | GoPlus | GoPlus |
+
+### Robinhood Chain: what trading it actually costs you
+
+Three gates cannot be evaluated there — honeypot, LP lock, and full holder
+concentration. Under §2 that is an automatic rejection, so trading this chain
+requires an explicit exception (`partial_coverage_chains` in Config). Taking
+that exception means accepting, in writing:
+
+1. **You cannot prove the token is sellable before you buy.** On Solana a
+   full-size Jupiter quote proves the exit exists. There is no equivalent here
+   until an EVM sell simulation is built (see below).
+2. **You cannot prove the LP is locked.** The pool can be pulled.
+3. **Equity-quoted pairs carry two exposures.** An AI/NVDA pair moves with the
+   token *and* with NVDA, and your exit routes through NVDA's own liquidity,
+   which is not screened.
+4. **Proxy contracts are common here.** Every other gate describes the contract
+   as deployed today; a proxy means that can be replaced tomorrow.
+
+Position size on chains with partial coverage is **halved** (§4.8) because the
+information is worse, not because the tokens are.
+
+### Not yet implemented for execution
+
+- **`RH_ROUTER` and `RH_WETH` are unset.** Deliberately: a wrong router address
+  sends funds to an arbitrary contract. Source them from official docs and
+  confirm on the block explorer.
+- **Uniswap V4 is not supported.** Several Robinhood Chain pools are V4, which
+  uses a singleton PoolManager rather than V3's router interface. The current
+  adapter builds V3 `exactInputSingle` calls and will fail or misroute on V4
+  pools.
+- **No EVM sell simulation.** The honest substitute for a honeypot check is an
+  `eth_call` simulating the sell before committing. Until that exists, gate 2.8
+  is unverifiable on all EVM chains.
 
 ---
 
@@ -123,6 +174,7 @@ people planning to exit into the resulting bid. Therefore:
 | 4.5 | Max concurrent positions | 5 |
 | 4.6 | Max total deployed | 20% of allocated capital; remainder in stables |
 | 4.7 | Averaging down | **Prohibited.** No exceptions |
+| 4.8 | Partial-coverage chains | Position **halved** where honeypot or LP lock cannot be verified |
 
 Rule 4.3 is what makes exits possible. Position size is dictated by the exit,
 not the entry.
