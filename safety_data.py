@@ -77,42 +77,86 @@ class ReportView:
         self.r = report or {}
 
     # -- gate 2.3 ---------------------------------------------------------
-    def primary_market(self) -> Optional[dict]:
-        """The pool holding the most liquidity.
+    @staticmethod
+    def _lp_has_real_data(lp: dict) -> bool:
+        """True if RugCheck actually measured this pool's LP, not just that
+        the fields exist and happen to be zero.
 
-        Tokens routinely have hundreds or thousands of markets (BONK: 1284).
-        Taking the max lock% across all of them lets one obscure locked pool
-        vouch for a token whose real pool is wide open. The pool that matters
-        is the one your trade would actually route through.
+        Found on BULLSHIT: the single largest-liquidity pool ($320k) had
+        lpLockedPct=0 with lpLocked=0, lpMaxSupply=0, lpTotalSupply=0 — every
+        LP field zero. That is an unindexed pool, not a measured unlocked
+        one. Treating it as "0% locked" reported a false negative on a token
+        whose actual LP (in a smaller, $231k pool) was 100% locked.
+        """
+        return _num(lp.get("lpTotalSupply")) > 0 or _num(lp.get("lpMaxSupply")) > 0
+
+    def primary_market(self) -> Optional[dict]:
+        """Highest-liquidity pool that RugCheck actually has LP data for.
+
+        Ranking by liquidity alone (the previous version) can select a pool
+        RugCheck never indexed, which reports as a false 0%. Ranking without
+        excluding empty-data pools, or taking a naive max across all markets
+        (the pre-BONK-fix version), both fail in opposite directions. This
+        filters to measured pools first, then takes the highest-liquidity
+        one among those.
         """
         markets = self.r.get("markets") or []
         best, best_liq = None, -1.0
         for m in markets:
             lp = m.get("lp") or {}
+            if not self._lp_has_real_data(lp):
+                continue
             liq = _num(lp.get("baseUSD")) + _num(lp.get("quoteUSD"))
             if liq > best_liq:
                 best, best_liq = m, liq
         return best
 
     def lp_locked_pct(self) -> Optional[float]:
-        """Lock percentage of the PRIMARY pool only."""
-        m = self.primary_market()
-        if not m:
+        """Liquidity-weighted lock percentage across every pool RugCheck has
+        real LP data for — not just the single largest one.
+
+        A single "primary pool" is still vulnerable to the exact failure just
+        found: if the biggest pool happens to be unindexed, only the next
+        pool down is even visible. Weighting by liquidity across every
+        MEASURED pool means one unindexed giant can no longer hide a real,
+        smaller, verified lock — and a tiny locked pool still cannot outvote
+        a large unlocked one, which was the original BONK problem.
+        """
+        markets = self.r.get("markets") or []
+        total_liq, locked_liq = 0.0, 0.0
+        measured_any = False
+        for m in markets:
+            lp = m.get("lp") or {}
+            if not self._lp_has_real_data(lp):
+                continue
+            liq = _num(lp.get("baseUSD")) + _num(lp.get("quoteUSD"))
+            if liq <= 0:
+                continue
+            pct = None
+            for key in ("lpLockedPct", "lpBurnPct"):
+                if key in lp:
+                    v = _num(lp[key], -1)
+                    if v >= 0:
+                        pct = v
+                        break
+            if pct is None:
+                continue
+            measured_any = True
+            total_liq += liq
+            locked_liq += liq * pct / 100
+        if not measured_any or total_liq <= 0:
             return None
-        lp = m.get("lp") or {}
-        for key in ("lpLockedPct", "lpBurnPct"):
-            if key in lp:
-                v = _num(lp[key], -1)
-                if v >= 0:
-                    return v
-        return None
+        return locked_liq / total_liq * 100
 
     def primary_liquidity_usd(self) -> float:
-        m = self.primary_market()
-        if not m:
-            return 0.0
-        lp = m.get("lp") or {}
-        return _num(lp.get("baseUSD")) + _num(lp.get("quoteUSD"))
+        """Total liquidity across pools RugCheck has real LP data for."""
+        markets = self.r.get("markets") or []
+        total = 0.0
+        for m in markets:
+            lp = m.get("lp") or {}
+            if self._lp_has_real_data(lp):
+                total += _num(lp.get("baseUSD")) + _num(lp.get("quoteUSD"))
+        return total
 
     # -- gates 2.4 / 2.5 --------------------------------------------------
     # RugCheck labels addresses it recognises. AMM vaults, LP accounts and
