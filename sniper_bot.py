@@ -32,6 +32,27 @@ import requests
 
 LOG = logging.getLogger("bot")
 
+
+def app_data_dir() -> Path:
+    """Writable per-user directory for state.
+
+    A packaged .app or .exe launches with its working directory set somewhere
+    read-only, so a relative db path fails with "unable to open database file".
+    """
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "TradingBot"
+    elif sys.platform == "win32":
+        base = Path(os.getenv("APPDATA", Path.home())) / "TradingBot"
+    else:
+        base = Path(os.getenv("XDG_DATA_HOME",
+                              Path.home() / ".local" / "share")) / "TradingBot"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+    except OSError:
+        import tempfile
+        return Path(tempfile.gettempdir())
+
 BURN_ADDRESSES = {
     "1nc1nerator11111111111111111111111111111111",
     "11111111111111111111111111111111",
@@ -118,8 +139,8 @@ class Config:
     # -- loop -------------------------------------------------------------
     scan_interval_sec: int = 120
     exit_check_interval_sec: int = 30
-    db_path: str = "bot_state.db"
-    halt_file: str = "HALT"
+    db_path: str = field(default_factory=lambda: str(app_data_dir() / "bot_state.db"))
+    halt_file: str = field(default_factory=lambda: str(app_data_dir() / "HALT"))
 
 
 # ──────────────────────────────── models ───────────────────────────────────
@@ -729,7 +750,12 @@ class CircuitBreakers:
 
 class Journal:
     def __init__(self, path: str):
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
         self.db = sqlite3.connect(path, check_same_thread=False)
+        LOG.info("state file: %s", path)
         self.db.execute("""CREATE TABLE IF NOT EXISTS decisions(
             ts REAL, mint TEXT, symbol TEXT, action TEXT, detail TEXT)""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS trades(
