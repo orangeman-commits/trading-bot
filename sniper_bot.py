@@ -33,7 +33,6 @@ import requests
 LOG = logging.getLogger("bot")
 
 
-
 def app_data_dir() -> Path:
     """Writable per-user directory for state.
 
@@ -140,8 +139,8 @@ class Config:
     # -- loop -------------------------------------------------------------
     scan_interval_sec: int = 120
     exit_check_interval_sec: int = 30
-    db_path: str = "bot_state.db"
-    halt_file: str = "HALT"
+    db_path: str = field(default_factory=lambda: str(app_data_dir() / "bot_state.db"))
+    halt_file: str = field(default_factory=lambda: str(app_data_dir() / "HALT"))
 
 
 # ──────────────────────────────── models ───────────────────────────────────
@@ -751,7 +750,12 @@ class CircuitBreakers:
 
 class Journal:
     def __init__(self, path: str):
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
         self.db = sqlite3.connect(path, check_same_thread=False)
+        LOG.info("state file: %s", path)
         self.db.execute("""CREATE TABLE IF NOT EXISTS decisions(
             ts REAL, mint TEXT, symbol TEXT, action TEXT, detail TEXT)""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS trades(
