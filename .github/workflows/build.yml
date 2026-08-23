@@ -1,0 +1,51 @@
+name: Build desktop binaries
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+      - name: Build
+        run: pyinstaller tradingbot.spec --clean --noconfirm
+      - name: Package
+        run: Compress-Archive -Path dist/TradingBot/* -DestinationPath TradingBot-windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TradingBot-windows
+          path: TradingBot-windows.zip
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+      - name: Build
+        run: pyinstaller tradingbot.spec --clean --noconfirm
+      - name: Create DMG
+        run: |
+          test -d "dist/TradingBot.app" || { echo ".app missing"; exit 1; }
+          mkdir -p dmg && cp -R "dist/TradingBot.app" dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "TradingBot" -srcfolder dmg -ov -format UDZO TradingBot-macos.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TradingBot-macos
+          path: TradingBot-macos.dmg

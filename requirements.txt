@@ -1,0 +1,6 @@
+requests>=2.31
+solders>=0.21
+base58>=2.1
+pynacl>=1.5
+web3>=7.0
+python-telegram-bot>=21

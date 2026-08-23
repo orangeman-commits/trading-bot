@@ -1,0 +1,15 @@
+.env
+.env.*
+*.key
+*.pem
+*keypair*.json
+bot_state.db
+*.db
+*.log
+HALT
+build/
+dist/
+__pycache__/
+*.pyc
+.DS_Store
+scratch/

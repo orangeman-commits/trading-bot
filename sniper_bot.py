@@ -1,0 +1,998 @@
+#!/usr/bin/env python3
+"""
+Rule-based low-cap token scanner and position manager.
+Implements RULES.md v1.0. Solana adapter complete; Base requires an EVM adapter.
+
+Defaults to PAPER mode. Live trading is intentionally not implemented — see
+LiveBroker. Read RULES.md before changing any threshold in Config.
+
+    python sniper_bot.py --once      # single scan cycle, prints decisions
+    python sniper_bot.py             # continuous loop
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import os
+import sqlite3
+import sys
+import time
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any, Optional
+
+LAMPORTS_PER_SOL = 1_000_000_000
+
+import requests
+
+LOG = logging.getLogger("bot")
+
+BURN_ADDRESSES = {
+    "1nc1nerator11111111111111111111111111111111",
+    "11111111111111111111111111111111",
+}
+
+# Populate from a maintained list. Incomplete coverage inflates apparent
+# holder concentration and causes false rejections (safe direction).
+KNOWN_CEX_ADDRESSES: set[str] = set()
+
+
+# ─────────────────────────────── config ────────────────────────────────────
+
+@dataclass
+class Config:
+    # -- mode -------------------------------------------------------------
+    mode: str = "PAPER"                      # PAPER | LIVE  (rule 8.1)
+    capital_usd: float = 10_000.0
+
+    # -- endpoints --------------------------------------------------------
+    solana_rpc: str = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+    dexscreener: str = "https://api.dexscreener.com"
+    jupiter_quote: str = "https://api.jup.ag/swap/v1/quote"  # v6/lite-api deprecated
+
+    # -- §1 discovery -----------------------------------------------------
+    min_pair_age_min: int = 45
+    max_pair_age_hr: int = 72
+    min_liquidity_usd: float = 40_000
+    min_fdv_usd: float = 200_000
+    max_fdv_usd: float = 8_000_000
+    min_volume_24h_usd: float = 150_000
+    min_vol_liq_ratio: float = 1.5
+    max_vol_liq_ratio: float = 25.0
+    min_unique_traders_24h: int = 250
+    min_buy_sell_ratio: float = 0.8
+    max_buy_sell_ratio: float = 3.0
+    allowed_quotes: tuple = ("SOL", "WETH", "USDC")
+
+    # -- §2 safety --------------------------------------------------------
+    min_lp_burned_pct: float = 90.0
+    max_top10_pct: float = 25.0
+    max_single_holder_pct: float = 8.0
+    max_deployer_pct: float = 5.0
+    max_round_trip_tax_pct: float = 5.0
+    max_exit_price_impact_pct: float = 4.0
+    strict_lp_check: bool = True             # UNKNOWN LP status => reject
+
+    # -- §3 scoring -------------------------------------------------------
+    min_score: int = 62
+    min_cohort_wallets: int = 3
+    cohort_enabled: bool = False       # True once a verified wallet list exists
+    sentiment_spike_multiple: float = 8.0
+
+    # -- §4 sizing --------------------------------------------------------
+    base_position_pct: float = 2.0
+    max_position_pct: float = 3.0
+    max_pct_of_liquidity: float = 0.5
+    max_concurrent_positions: int = 5
+    max_deployed_pct: float = 20.0
+
+    # -- §5 entry ---------------------------------------------------------
+    max_slippage_pct: float = 3.0
+    max_chase_pct: float = 8.0
+
+    # -- §6 exits ---------------------------------------------------------
+    tp1_gain_pct: float = 100.0
+    tp1_sell_pct: float = 50.0
+    tp2_gain_pct: float = 300.0
+    tp2_sell_pct: float = 25.0
+    trailing_stop_pct: float = 35.0
+    hard_stop_pct: float = -35.0
+    time_stop_hours: int = 24
+    time_stop_min_gain_pct: float = 20.0
+    volume_death_pct: float = 15.0
+    liq_drop_exit_pct: float = 25.0
+    emergency_impact_pct: float = 10.0
+
+    # -- §7 breakers ------------------------------------------------------
+    daily_loss_halt_pct: float = -10.0
+    consecutive_loss_halt: int = 4
+    weekly_drawdown_halt_pct: float = -20.0
+    total_drawdown_stop_pct: float = -35.0
+    max_feed_staleness_sec: int = 90
+
+    # -- loop -------------------------------------------------------------
+    scan_interval_sec: int = 120
+    exit_check_interval_sec: int = 30
+    db_path: str = "bot_state.db"
+    halt_file: str = "HALT"
+
+
+# ──────────────────────────────── models ───────────────────────────────────
+
+class Verdict(str, Enum):
+    PASS = "PASS"
+    REJECT = "REJECT"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass
+class GateResult:
+    name: str
+    verdict: Verdict
+    detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.verdict is Verdict.PASS
+
+
+@dataclass
+class Candidate:
+    chain: str
+    mint: str
+    symbol: str
+    pair_address: str
+    price_usd: float
+    liquidity_usd: float
+    fdv_usd: float
+    volume_24h: float
+    txns_buys_24h: int
+    txns_sells_24h: int
+    pair_created_ms: int
+    quote_symbol: str
+    raw: dict = field(default_factory=dict)
+
+    @property
+    def age_minutes(self) -> float:
+        return (time.time() * 1000 - self.pair_created_ms) / 60_000
+
+    @property
+    def vol_liq_ratio(self) -> float:
+        return self.volume_24h / self.liquidity_usd if self.liquidity_usd else 0.0
+
+    @property
+    def buy_sell_ratio(self) -> float:
+        return self.txns_buys_24h / max(self.txns_sells_24h, 1)
+
+
+@dataclass
+class Position:
+    mint: str
+    symbol: str
+    chain: str
+    pair_address: str
+    decimals: int
+    entry_price: float
+    entry_time: float
+    qty: float
+    cost_usd: float
+    entry_liquidity: float
+    entry_hourly_volume: float
+    high_water_price: float
+    tp1_done: bool = False
+    tp2_done: bool = False
+    realised_usd: float = 0.0
+
+    def gain_pct(self, price: float) -> float:
+        return (price / self.entry_price - 1) * 100
+
+    def hours_held(self) -> float:
+        return (time.time() - self.entry_time) / 3600
+
+
+# ──────────────────────────── data clients ─────────────────────────────────
+
+class HttpClient:
+    def __init__(self, timeout: int = 12):
+        self.s = requests.Session()
+        self.s.headers["User-Agent"] = "rule-bot/1.0"
+        self.timeout = timeout
+
+    def get_json(self, url: str, **kw) -> Optional[dict]:
+        for attempt in range(3):
+            try:
+                r = self.s.get(url, timeout=self.timeout, **kw)
+                if r.status_code == 429:
+                    time.sleep(2 ** attempt)
+                    continue
+                r.raise_for_status()
+                return r.json()
+            except Exception as e:  # noqa: BLE001
+                LOG.debug("GET %s failed (%s/3): %s", url, attempt + 1, e)
+                time.sleep(1 + attempt)
+        return None
+
+    def post_json(self, url: str, payload: dict) -> Optional[dict]:
+        try:
+            r = self.s.post(url, json=payload, timeout=self.timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:  # noqa: BLE001
+            LOG.debug("POST %s failed: %s", url, e)
+            return None
+
+
+class DexScreener:
+    """Pair discovery and live pricing.
+
+    Endpoints drift. Verify against docs.dexscreener.com before live use.
+    """
+
+    def __init__(self, http: HttpClient, cfg: Config):
+        self.http, self.cfg = http, cfg
+
+    def search(self, query: str) -> list[Candidate]:
+        data = self.http.get_json(f"{self.cfg.dexscreener}/latest/dex/search",
+                                  params={"q": query})
+        if not data:
+            return []
+        return [c for c in (self._parse(p) for p in data.get("pairs") or []) if c]
+
+    def pair(self, chain: str, pair_address: str) -> Optional[Candidate]:
+        data = self.http.get_json(
+            f"{self.cfg.dexscreener}/latest/dex/pairs/{chain}/{pair_address}")
+        pairs = (data or {}).get("pairs") or []
+        return self._parse(pairs[0]) if pairs else None
+
+    @staticmethod
+    def _parse(p: dict) -> Optional[Candidate]:
+        try:
+            txns = p.get("txns", {}).get("h24", {}) or {}
+            return Candidate(
+                chain=p["chainId"],
+                mint=p["baseToken"]["address"],
+                symbol=p["baseToken"].get("symbol", "?"),
+                pair_address=p["pairAddress"],
+                price_usd=float(p.get("priceUsd") or 0),
+                liquidity_usd=float((p.get("liquidity") or {}).get("usd") or 0),
+                fdv_usd=float(p.get("fdv") or 0),
+                volume_24h=float((p.get("volume") or {}).get("h24") or 0),
+                txns_buys_24h=int(txns.get("buys") or 0),
+                txns_sells_24h=int(txns.get("sells") or 0),
+                pair_created_ms=int(p.get("pairCreatedAt") or 0),
+                quote_symbol=(p.get("quoteToken") or {}).get("symbol", "?"),
+                raw=p,
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+
+class SolanaRPC:
+    def __init__(self, http: HttpClient, cfg: Config):
+        self.http, self.cfg = http, cfg
+        self._id = 0
+
+    def _call(self, method: str, params: list) -> Optional[Any]:
+        self._id += 1
+        res = self.http.post_json(self.cfg.solana_rpc, {
+            "jsonrpc": "2.0", "id": self._id, "method": method, "params": params})
+        if res is None or "error" in res:
+            LOG.debug("RPC %s error: %s", method, (res or {}).get("error"))
+            return None
+        return res.get("result")
+
+    def mint_info(self, mint: str) -> Optional[dict]:
+        """Returns mintAuthority, freezeAuthority, supply, decimals."""
+        res = self._call("getAccountInfo", [mint, {"encoding": "jsonParsed"}])
+        try:
+            return res["value"]["data"]["parsed"]["info"]
+        except (TypeError, KeyError):
+            return None
+
+    def largest_holders(self, mint: str) -> Optional[list[dict]]:
+        res = self._call("getTokenLargestAccounts", [mint])
+        return (res or {}).get("value") if res else None
+
+    def owner_of(self, token_account: str) -> Optional[str]:
+        res = self._call("getAccountInfo", [token_account, {"encoding": "jsonParsed"}])
+        try:
+            return res["value"]["data"]["parsed"]["info"]["owner"]
+        except (TypeError, KeyError):
+            return None
+
+
+class Jupiter:
+    """Quotes — used for pricing, sell simulation, and price-impact checks."""
+
+    SOL = "So11111111111111111111111111111111111111112"
+
+    def __init__(self, http: HttpClient, cfg: Config):
+        self.http, self.cfg = http, cfg
+
+    def quote(self, input_mint: str, output_mint: str, amount: int,
+              slippage_bps: int = 300) -> Optional[dict]:
+        return self.http.get_json(self.cfg.jupiter_quote, params={
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": str(amount),
+            "slippageBps": slippage_bps,
+            "onlyDirectRoutes": "false",
+        })
+
+    def can_sell(self, mint: str, raw_amount: int) -> tuple[bool, float, str]:
+        """Rule 2.8 / 2.10 — simulate selling the FULL position, not dust."""
+        q = self.quote(mint, self.SOL, raw_amount)
+        if not q or not q.get("outAmount"):
+            return False, 100.0, "no sell route for full size"
+        try:
+            impact = abs(float(q.get("priceImpactPct", 0))) * 100
+        except (TypeError, ValueError):
+            return False, 100.0, "unparseable price impact"
+        return True, impact, f"impact {impact:.2f}%"
+
+
+# ─────────────────────────── safety screen §2 ──────────────────────────────
+
+class SafetyScreen:
+    def __init__(self, rpc: SolanaRPC, jup: Jupiter, cfg: Config, rugcheck=None):
+        self.rpc, self.jup, self.cfg = rpc, jup, cfg
+        self.rugcheck = rugcheck
+
+    def run(self, cand: Candidate, intended_raw_amount: int) -> list[GateResult]:
+        if cand.chain != "solana":
+            return [GateResult("chain_adapter", Verdict.UNKNOWN,
+                               f"no safety adapter for {cand.chain}")]
+
+        results: list[GateResult] = []
+        info = self.rpc.mint_info(cand.mint)
+        if not info:
+            return [GateResult("mint_info", Verdict.UNKNOWN, "mint account unreadable")]
+
+        # 2.1 / 2.2 — authorities must be revoked
+        results.append(GateResult(
+            "2.1_mint_authority",
+            Verdict.PASS if info.get("mintAuthority") is None else Verdict.REJECT,
+            str(info.get("mintAuthority"))))
+        results.append(GateResult(
+            "2.2_freeze_authority",
+            Verdict.PASS if info.get("freezeAuthority") is None else Verdict.REJECT,
+            str(info.get("freezeAuthority"))))
+
+        # 2.4 / 2.5 — holder concentration
+        results.extend(self._concentration_gates(cand, info))
+
+        # 2.8 / 2.10 — full-size sell simulation
+        ok, impact, detail = self.jup.can_sell(cand.mint, intended_raw_amount)
+        results.append(GateResult("2.8_sell_simulation",
+                                  Verdict.PASS if ok else Verdict.REJECT, detail))
+        results.append(GateResult(
+            "2.10_exit_price_impact",
+            Verdict.PASS if ok and impact < self.cfg.max_exit_price_impact_pct
+            else Verdict.REJECT, f"{impact:.2f}%"))
+
+        results.extend(self._rugcheck_gates(cand))
+        return results
+
+    def _rugcheck_gates(self, cand: Candidate) -> list[GateResult]:
+        """Gates 2.3, 2.6, 2.9 and the aggregate risk check, from RugCheck."""
+        from safety_data import ReportView
+
+        rep = self.rugcheck.report(cand.mint) if self.rugcheck else None
+        if not rep:
+            return [GateResult("2.x_rugcheck", Verdict.UNKNOWN, "no report")]
+        v = ReportView(rep)
+        out: list[GateResult] = []
+
+        out.append(GateResult("2.0_rugged_flag",
+                              Verdict.REJECT if v.rugged() else Verdict.PASS,
+                              str(v.rugged())))
+
+        danger = v.danger_risks()
+        out.append(GateResult("2.0_danger_risks",
+                              Verdict.REJECT if danger else Verdict.PASS,
+                              ", ".join(danger) or "none"))
+
+        lp = v.lp_locked_pct()
+        out.append(GateResult(
+            "2.3_lp_burned",
+            Verdict.UNKNOWN if lp is None else
+            (Verdict.PASS if lp >= self.cfg.min_lp_burned_pct else Verdict.REJECT),
+            "unknown" if lp is None else f"{lp:.1f}%"))
+
+        creator = v.creator_pct()
+        out.append(GateResult(
+            "2.6_deployer_balance",
+            Verdict.UNKNOWN if creator is None else
+            (Verdict.PASS if creator < self.cfg.max_deployer_pct else Verdict.REJECT),
+            "unknown" if creator is None else f"{creator:.2f}%"))
+
+        fee = v.transfer_fee_pct()
+        out.append(GateResult(
+            "2.9_transfer_tax",
+            Verdict.PASS if fee < self.cfg.max_round_trip_tax_pct else Verdict.REJECT,
+            f"{fee:.2f}%"))
+
+        # 2.7 deployer history and 2.11 impersonation still need their own
+        # datasets; RugCheck's danger risks partially cover 2.11.
+        return out
+
+    def _concentration_gates(self, cand: Candidate, info: dict) -> list[GateResult]:
+        holders = self.rpc.largest_holders(cand.mint)
+        if not holders:
+            return [GateResult("2.4_top10_concentration", Verdict.UNKNOWN,
+                               "holder data unavailable")]
+        try:
+            supply = float(info["supply"])
+        except (KeyError, TypeError, ValueError):
+            return [GateResult("2.4_top10_concentration", Verdict.UNKNOWN, "no supply")]
+        if supply <= 0:
+            return [GateResult("2.4_top10_concentration", Verdict.UNKNOWN, "zero supply")]
+
+        filtered: list[float] = []
+        for h in holders:
+            owner = self.rpc.owner_of(h["address"]) or h["address"]
+            if owner in BURN_ADDRESSES or owner in KNOWN_CEX_ADDRESSES:
+                continue
+            filtered.append(float(h.get("amount", 0)) / supply * 100)
+
+        top10 = sum(sorted(filtered, reverse=True)[:10])
+        largest = max(filtered, default=0.0)
+        return [
+            GateResult("2.4_top10_concentration",
+                       Verdict.PASS if top10 < self.cfg.max_top10_pct else Verdict.REJECT,
+                       f"{top10:.1f}%"),
+            GateResult("2.5_largest_holder",
+                       Verdict.PASS if largest < self.cfg.max_single_holder_pct
+                       else Verdict.REJECT, f"{largest:.1f}%"),
+        ]
+
+
+# ───────────────────────────── discovery §1 ────────────────────────────────
+
+def discovery_filters(c: Candidate, cfg: Config) -> list[GateResult]:
+    def gate(name: str, ok: bool, detail: str) -> GateResult:
+        return GateResult(name, Verdict.PASS if ok else Verdict.REJECT, detail)
+
+    age = c.age_minutes
+    return [
+        gate("1.1_pair_age", cfg.min_pair_age_min <= age <= cfg.max_pair_age_hr * 60,
+             f"{age:.0f}m"),
+        gate("1.2_liquidity", c.liquidity_usd >= cfg.min_liquidity_usd,
+             f"${c.liquidity_usd:,.0f}"),
+        gate("1.3_fdv", cfg.min_fdv_usd <= c.fdv_usd <= cfg.max_fdv_usd,
+             f"${c.fdv_usd:,.0f}"),
+        gate("1.4_volume", c.volume_24h >= cfg.min_volume_24h_usd,
+             f"${c.volume_24h:,.0f}"),
+        gate("1.5_vol_liq_ratio",
+             cfg.min_vol_liq_ratio <= c.vol_liq_ratio <= cfg.max_vol_liq_ratio,
+             f"{c.vol_liq_ratio:.1f}x"),
+        gate("1.7_buy_sell_ratio",
+             cfg.min_buy_sell_ratio <= c.buy_sell_ratio <= cfg.max_buy_sell_ratio,
+             f"{c.buy_sell_ratio:.2f}"),
+        gate("1.8_quote_asset", c.quote_symbol in cfg.allowed_quotes, c.quote_symbol),
+    ]
+
+
+# ────────────────────────────── scoring §3 ─────────────────────────────────
+
+class Scorer:
+    """Signals not backed by a real data source return 0, never a guess.
+    A token cannot reach min_score on liquidity and volume alone — by design."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def score(self, c: Candidate,
+              cohort_buys: int = 0,
+              holder_growth_per_hr: float = 0.0,
+              sentiment: Optional[dict] = None) -> tuple[int, dict]:
+        parts: dict[str, float] = {}
+
+        # Liquidity depth, log-scaled against the floor (max 20)
+        parts["liquidity"] = min(
+            20.0, 20 * math.log10(max(c.liquidity_usd, 1) / self.cfg.min_liquidity_usd + 1)
+            / math.log10(11))
+
+        # Holder growth (max 20)
+        parts["holder_growth"] = min(20.0, holder_growth_per_hr / 5.0)
+
+        # Smart money — §3.1, all-or-nothing above the independence threshold.
+        # With no cohort list configured the 30 points are unreachable, so they
+        # redistribute to on-chain signals rather than making entry impossible.
+        parts["smart_money"] = (
+            30.0 if (self.cfg.cohort_enabled
+                     and cohort_buys >= self.cfg.min_cohort_wallets) else 0.0)
+
+        # Volume quality (max 15): penalise ratios that look washed
+        r = c.vol_liq_ratio
+        parts["volume_quality"] = 15.0 if 2 <= r <= 10 else (7.0 if r < 2 else 3.0)
+
+        # Sentiment — §3.2, capped, and a spike is a penalty
+        parts["sentiment"] = self._sentiment(sentiment)
+
+        if not self.cfg.cohort_enabled:
+            # The 30 smart-money points are unreachable without a verified
+            # wallet list, so redistribute them across the on-chain signals
+            # rather than making every entry mathematically impossible.
+            for k, mult in (("liquidity", 1.75), ("holder_growth", 1.75),
+                            ("volume_quality", 1.5)):
+                parts[k] *= mult
+
+        total = int(round(sum(parts.values())))
+        return max(0, min(100, total)), parts
+
+    def _sentiment(self, s: Optional[dict]) -> float:
+        if not s:
+            return 0.0
+        baseline = s.get("baseline_hourly_mentions", 0)
+        current = s.get("current_hourly_mentions", 0)
+        if baseline > 0 and current >= baseline * self.cfg.sentiment_spike_multiple:
+            return -20.0          # distribution event, not a buy signal
+        weighted = s.get("authenticity_weighted_mentions", 0)
+        return min(15.0, weighted / 20.0)
+
+
+# ────────────────────────────── execution ──────────────────────────────────
+
+class PaperBroker:
+    """Executes against real quoted prices. Moves no funds."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.cash = cfg.capital_usd
+
+    def buy(self, c: Candidate, usd: float, decimals: int = 9) -> Optional[Position]:
+        if usd > self.cash:
+            LOG.warning("insufficient paper cash")
+            return None
+        self.cash -= usd
+        LOG.info("BUY  %-10s $%s @ %.10f", c.symbol, f"{usd:,.0f}", c.price_usd)
+        return Position(
+            mint=c.mint, symbol=c.symbol, chain=c.chain,
+            pair_address=c.pair_address, decimals=decimals,
+            entry_price=c.price_usd, entry_time=time.time(),
+            qty=usd / c.price_usd, cost_usd=usd,
+            entry_liquidity=c.liquidity_usd,
+            entry_hourly_volume=c.volume_24h / 24,
+            high_water_price=c.price_usd)
+
+    def sell(self, pos: Position, price: float, fraction: float, reason: str) -> float:
+        qty = pos.qty * fraction
+        proceeds = qty * price
+        pos.qty -= qty
+        pos.realised_usd += proceeds
+        self.cash += proceeds
+        LOG.info("SELL %-10s %.0f%% @ %.10f (%+.1f%%) — %s",
+                 pos.symbol, fraction * 100, price, pos.gain_pct(price), reason)
+        return proceeds
+
+
+class LiveBrokerAdapter:
+    """Wraps execution.LiveBroker in the PaperBroker interface so the strategy
+    code is identical in both modes. Positions are sized in USD but swaps are
+    denominated in SOL, so a SOL/USD price is required."""
+
+    def __init__(self, live, sol_usd_price: float = 0.0):
+        self.live = live
+        self.sol_usd = sol_usd_price
+        self.cash = 0.0
+
+    def _sol_price(self) -> float:
+        if self.sol_usd > 0:
+            return self.sol_usd
+        raise RuntimeError("SOL/USD price not set — call set_sol_price() each cycle")
+
+    def set_sol_price(self, usd: float) -> None:
+        self.sol_usd = usd
+
+    def buy(self, c: Candidate, usd: float, decimals: int = 9) -> Optional[Position]:
+        res = self.live.buy(c.mint, usd / self._sol_price())
+        if not res.ok:
+            LOG.error("BUY FAILED %s — %s", c.symbol, res.error)
+            return None
+        qty = res.out_amount / 10 ** decimals
+        LOG.info("BUY  %-10s $%s  sig=%s", c.symbol, f"{usd:,.0f}", res.signature[:16])
+        return Position(
+            mint=c.mint, symbol=c.symbol, chain=c.chain,
+            pair_address=c.pair_address, decimals=decimals,
+            entry_price=usd / qty if qty else c.price_usd,
+            entry_time=time.time(), qty=qty, cost_usd=usd,
+            entry_liquidity=c.liquidity_usd,
+            entry_hourly_volume=c.volume_24h / 24,
+            high_water_price=c.price_usd)
+
+    def sell(self, pos: Position, price: float, fraction: float, reason: str) -> float:
+        if fraction >= 1.0:
+            res = self.live.sell_all(pos.mint)
+        else:
+            res = self.live.sell(pos.mint, int(pos.qty * fraction * 10 ** pos.decimals))
+        if not res.ok:
+            LOG.error("SELL FAILED %s — %s (position still open)", pos.symbol, res.error)
+            return 0.0
+        proceeds = res.out_amount / LAMPORTS_PER_SOL * self._sol_price()
+        pos.qty -= pos.qty * fraction
+        pos.realised_usd += proceeds
+        LOG.info("SELL %-10s %.0f%% -> $%.2f — %s  sig=%s",
+                 pos.symbol, fraction * 100, proceeds, reason, res.signature[:16])
+        return proceeds
+
+
+# ─────────────────────────── exit engine §6 ────────────────────────────────
+
+@dataclass
+class ExitSignal:
+    fraction: float
+    reason: str
+    emergency: bool = False
+
+
+def evaluate_exits(pos: Position, live: Candidate, cfg: Config,
+                   sell_ok: bool, exit_impact: float,
+                   authority_reappeared: bool = False,
+                   insider_dump: bool = False) -> Optional[ExitSignal]:
+    """First rule that fires wins. Emergency rules are checked first."""
+    price = live.price_usd
+    if price <= 0:
+        return None
+    pos.high_water_price = max(pos.high_water_price, price)
+    gain = pos.gain_pct(price)
+
+    # §6.3 emergency — bypass the ladder
+    liq_drop = (1 - live.liquidity_usd / pos.entry_liquidity) * 100 \
+        if pos.entry_liquidity else 0
+    if liq_drop > cfg.liq_drop_exit_pct:
+        return ExitSignal(1.0, f"6.3.1 liquidity -{liq_drop:.0f}%", True)
+    if insider_dump:
+        return ExitSignal(1.0, "6.3.2 insider distribution", True)
+    if authority_reappeared:
+        return ExitSignal(1.0, "6.3.3 mint/freeze authority restored", True)
+    if not sell_ok:
+        return ExitSignal(1.0, "6.3.4 sell simulation failing", True)
+    if exit_impact > cfg.emergency_impact_pct:
+        return ExitSignal(1.0, f"6.3.5 exit impact {exit_impact:.1f}%", True)
+
+    # §6.2 stops
+    if gain <= cfg.hard_stop_pct:
+        return ExitSignal(1.0, f"6.2.1 hard stop {gain:.1f}%")
+    if pos.hours_held() >= cfg.time_stop_hours and gain < cfg.time_stop_min_gain_pct:
+        return ExitSignal(1.0, f"6.2.2 time stop, {gain:+.1f}% in 24h")
+    hourly = live.volume_24h / 24
+    if pos.entry_hourly_volume > 0 and \
+            hourly < pos.entry_hourly_volume * cfg.volume_death_pct / 100:
+        return ExitSignal(1.0, "6.2.3 volume collapse")
+
+    # §6.1 profit ladder
+    if not pos.tp1_done and gain >= cfg.tp1_gain_pct:
+        pos.tp1_done = True
+        return ExitSignal(cfg.tp1_sell_pct / 100, f"6.1 TP1 at {gain:+.0f}%")
+    if not pos.tp2_done and gain >= cfg.tp2_gain_pct:
+        pos.tp2_done = True
+        return ExitSignal(cfg.tp2_sell_pct / 100 / 0.5, f"6.1 TP2 at {gain:+.0f}%")
+    if pos.tp1_done:
+        drawdown = (1 - price / pos.high_water_price) * 100
+        if drawdown >= cfg.trailing_stop_pct:
+            return ExitSignal(1.0, f"6.1 trailing stop -{drawdown:.0f}% from high")
+    return None
+
+
+# ──────────────────────────── breakers §7 ──────────────────────────────────
+
+class CircuitBreakers:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.day_start_equity = cfg.capital_usd
+        self.peak_equity = cfg.capital_usd
+        self.consecutive_losses = 0
+        self.halted_until = 0.0
+        self.hard_stopped = False
+
+    def record_close(self, pnl_usd: float) -> None:
+        self.consecutive_losses = self.consecutive_losses + 1 if pnl_usd < 0 else 0
+        if self.consecutive_losses >= self.cfg.consecutive_loss_halt:
+            self._halt(24, f"{self.consecutive_losses} consecutive losses")
+
+    def check(self, equity: float) -> bool:
+        """Returns True if new entries are allowed. Exits are never halted."""
+        if self.hard_stopped:
+            return False
+        self.peak_equity = max(self.peak_equity, equity)
+
+        total_dd = (equity / self.peak_equity - 1) * 100
+        if total_dd <= self.cfg.total_drawdown_stop_pct:
+            LOG.critical("7.4 total drawdown %.1f%% — FULL STOP, manual restart required",
+                         total_dd)
+            self.hard_stopped = True
+            return False
+
+        daily = (equity / self.day_start_equity - 1) * 100
+        if daily <= self.cfg.daily_loss_halt_pct:
+            self._halt(24, f"daily PnL {daily:.1f}%")
+
+        if Path(self.cfg.halt_file).exists():
+            LOG.warning("HALT file present — entries blocked")
+            return False
+        return time.time() >= self.halted_until
+
+    def _halt(self, hours: int, reason: str) -> None:
+        if time.time() < self.halted_until:
+            return
+        self.halted_until = time.time() + hours * 3600
+        LOG.warning("CIRCUIT BREAKER: entries halted %dh — %s", hours, reason)
+
+
+# ────────────────────────────── journal §8.4 ───────────────────────────────
+
+class Journal:
+    def __init__(self, path: str):
+        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db.execute("""CREATE TABLE IF NOT EXISTS decisions(
+            ts REAL, mint TEXT, symbol TEXT, action TEXT, detail TEXT)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS trades(
+            ts REAL, mint TEXT, symbol TEXT, side TEXT,
+            price REAL, usd REAL, reason TEXT)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS blacklist(
+            mint TEXT PRIMARY KEY, reason TEXT, ts REAL)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS observations(
+            mint TEXT, ts REAL, holders INTEGER, liquidity REAL)""")
+        self.db.execute("""CREATE INDEX IF NOT EXISTS obs_mint ON observations(mint, ts)""")
+        self.db.commit()
+
+    def decision(self, mint: str, symbol: str, action: str, detail: Any) -> None:
+        self.db.execute("INSERT INTO decisions VALUES (?,?,?,?,?)",
+                        (time.time(), mint, symbol, action,
+                         json.dumps(detail, default=str)[:4000]))
+        self.db.commit()
+
+    def trade(self, mint: str, symbol: str, side: str,
+              price: float, usd: float, reason: str) -> None:
+        self.db.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?)",
+                        (time.time(), mint, symbol, side, price, usd, reason))
+        self.db.commit()
+
+    def blacklist(self, mint: str, reason: str) -> None:
+        self.db.execute("INSERT OR IGNORE INTO blacklist VALUES (?,?,?)",
+                        (mint, reason, time.time()))
+        self.db.commit()
+
+    def observe(self, mint: str, holders: int, liquidity: float) -> None:
+        self.db.execute("INSERT INTO observations VALUES (?,?,?,?)",
+                        (mint, time.time(), holders, liquidity))
+        self.db.commit()
+
+    def holder_growth_per_hr(self, mint: str) -> float:
+        """Derived from our own observations — no extra API dependency.
+        Returns 0.0 until at least two samples 10+ minutes apart exist."""
+        rows = self.db.execute(
+            "SELECT ts, holders FROM observations WHERE mint=? ORDER BY ts", (mint,)
+        ).fetchall()
+        if len(rows) < 2:
+            return 0.0
+        (t0, h0), (t1, h1) = rows[0], rows[-1]
+        hours = (t1 - t0) / 3600
+        if hours < 0.17 or h0 <= 0:
+            return 0.0
+        return max(0.0, (h1 - h0) / hours)
+
+    def is_blacklisted(self, mint: str) -> bool:
+        return self.db.execute(
+            "SELECT 1 FROM blacklist WHERE mint=?", (mint,)).fetchone() is not None
+
+
+# ──────────────────────────────── bot ──────────────────────────────────────
+
+class Bot:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        http = HttpClient()
+        self.dex = DexScreener(http, cfg)
+        self.rpc = SolanaRPC(http, cfg)
+        self.jup = Jupiter(http, cfg)
+        from safety_data import RugCheck
+        self.rugcheck = RugCheck()
+        self.screen = SafetyScreen(self.rpc, self.jup, cfg, self.rugcheck)
+        self.scorer = Scorer(cfg)
+        self.cohort = None       # plug a CohortTracker here once wallets verified
+        self.sentiment = None    # plug a SentimentSource here once X API wired
+        self.broker = self._make_broker(cfg)
+        self.breakers = CircuitBreakers(cfg)
+        self.journal = Journal(cfg.db_path)
+        self.positions: dict[str, Position] = {}
+
+    def _make_broker(self, cfg: Config):
+        if cfg.mode == "PAPER":
+            return PaperBroker(cfg)
+        from execution import JupiterSwap, LiveBroker, Wallet
+        LOG.warning("LIVE MODE — real funds at risk on wallet %s",
+                    "…" )
+        return LiveBrokerAdapter(
+            LiveBroker(cfg.solana_rpc, Wallet(), JupiterSwap(),
+                       cfg.max_slippage_pct, cfg.max_exit_price_impact_pct))
+
+    def holder_count(self, c: Candidate) -> int:
+        """Best-effort holder count for the growth signal."""
+        rep = self.rugcheck.report(c.mint)
+        if not rep:
+            return 0
+        return int(rep.get("totalHolders") or len(rep.get("topHolders") or []))
+
+    # -- sizing §4 --------------------------------------------------------
+    def position_size(self, c: Candidate) -> float:
+        base = self.cfg.capital_usd * self.cfg.base_position_pct / 100
+        cap = self.cfg.capital_usd * self.cfg.max_position_pct / 100
+        liq_cap = c.liquidity_usd * self.cfg.max_pct_of_liquidity / 100
+        return min(base, cap, liq_cap)
+
+    def deployed_usd(self) -> float:
+        return sum(p.qty * p.entry_price for p in self.positions.values())
+
+    def equity(self) -> float:
+        return self.broker.cash + self.deployed_usd()
+
+    # -- entry pipeline ---------------------------------------------------
+    def consider(self, c: Candidate) -> None:
+        if c.mint in self.positions or self.journal.is_blacklisted(c.mint):
+            return
+
+        gates = discovery_filters(c, self.cfg)
+        failed = [g for g in gates if not g.ok]
+        if failed:
+            self.journal.decision(c.mint, c.symbol, "REJECT_DISCOVERY",
+                                  [asdict(g) for g in failed])
+            return
+
+        size_usd = self.position_size(c)
+        if size_usd < 25:
+            return
+        info = self.rpc.mint_info(c.mint)
+        if not info:
+            self.journal.decision(c.mint, c.symbol, "REJECT_NO_MINT_INFO", {})
+            return
+        decimals = int(info.get("decimals", 9))
+        raw_amount = int(size_usd / c.price_usd * 10 ** decimals)
+
+        safety = self.screen.run(c, raw_amount)
+        blocking = [g for g in safety if not g.ok]
+        if blocking:
+            self.journal.decision(c.mint, c.symbol, "REJECT_SAFETY",
+                                  [asdict(g) for g in blocking])
+            if any(g.verdict is Verdict.REJECT for g in blocking):
+                self.journal.blacklist(c.mint, blocking[0].name)
+            LOG.info("REJECT %-10s — %s (%s)", c.symbol,
+                     blocking[0].name, blocking[0].detail)
+            return
+
+        self.journal.observe(c.mint, self.holder_count(c), c.liquidity_usd)
+        score, parts = self.scorer.score(
+            c,
+            cohort_buys=self.cohort.accumulating(c.mint) if self.cohort else 0,
+            holder_growth_per_hr=self.journal.holder_growth_per_hr(c.mint),
+            sentiment=self.sentiment.snapshot(c.symbol) if self.sentiment else None,
+        )
+        if score < self.cfg.min_score:
+            self.journal.decision(c.mint, c.symbol, "REJECT_SCORE",
+                                  {"score": score, **parts})
+            return
+
+        if len(self.positions) >= self.cfg.max_concurrent_positions:
+            return
+        if self.deployed_usd() + size_usd > \
+                self.cfg.capital_usd * self.cfg.max_deployed_pct / 100:
+            return
+        if not self.breakers.check(self.equity()):
+            return
+
+        fresh = self.dex.pair(c.chain, c.pair_address)      # rule 5.5, no chasing
+        if not fresh or abs(fresh.price_usd / c.price_usd - 1) * 100 > self.cfg.max_chase_pct:
+            self.journal.decision(c.mint, c.symbol, "ABORT_CHASE", {})
+            return
+
+        pos = self.broker.buy(fresh, size_usd, decimals)
+        if pos:
+            self.positions[pos.mint] = pos
+            self.journal.trade(pos.mint, pos.symbol, "BUY",
+                               pos.entry_price, size_usd, f"score={score}")
+
+    # -- exit pipeline ----------------------------------------------------
+    def manage_positions(self) -> None:
+        for mint, pos in list(self.positions.items()):
+            live = self.dex.pair(pos.chain, pos.pair_address)
+            if not live:
+                continue
+            raw = int(pos.qty * 10 ** pos.decimals)
+            sell_ok, impact, _ = self.jup.can_sell(mint, raw)
+            info = self.rpc.mint_info(mint)
+            authority_back = bool(info and (info.get("mintAuthority")
+                                            or info.get("freezeAuthority")))
+
+            sig = evaluate_exits(pos, live, self.cfg, sell_ok, impact, authority_back)
+            if not sig:
+                continue
+
+            fraction = min(1.0, sig.fraction)
+            proceeds = self.broker.sell(pos, live.price_usd, fraction, sig.reason)
+            self.journal.trade(mint, pos.symbol, "SELL",
+                               live.price_usd, proceeds, sig.reason)
+            if pos.qty <= 1e-9 or fraction >= 1.0:
+                pnl = pos.realised_usd - pos.cost_usd
+                self.breakers.record_close(pnl)
+                LOG.info("CLOSED %-10s PnL $%+.2f", pos.symbol, pnl)
+                del self.positions[mint]
+
+    # -- loop -------------------------------------------------------------
+    def scan(self, queries: list[str]) -> list[Candidate]:
+        out: list[Candidate] = []
+        for q in queries:
+            out.extend(self.dex.search(q))
+            time.sleep(0.5)
+        return out
+
+    def run_once(self, queries: list[str]) -> None:
+        self.manage_positions()
+        if not self.breakers.check(self.equity()):
+            LOG.info("entries blocked by circuit breaker")
+            return
+        for c in self.scan(queries):
+            if c.chain in ("solana", "base"):
+                self.consider(c)
+
+    def run(self, queries: list[str]) -> None:
+        LOG.info("mode=%s capital=$%s max_positions=%d", self.cfg.mode,
+                 f"{self.cfg.capital_usd:,.0f}", self.cfg.max_concurrent_positions)
+        last_scan = 0.0
+        while not self.breakers.hard_stopped:
+            try:
+                self.manage_positions()
+                if time.time() - last_scan > self.cfg.scan_interval_sec:
+                    if self.breakers.check(self.equity()):
+                        for c in self.scan(queries):
+                            if c.chain in ("solana", "base"):
+                                self.consider(c)
+                    last_scan = time.time()
+                time.sleep(self.cfg.exit_check_interval_sec)
+            except KeyboardInterrupt:
+                LOG.info("shutdown; equity $%s", f"{self.equity():,.2f}")
+                return
+            except Exception:  # noqa: BLE001
+                LOG.exception("loop error — positions still monitored")
+                time.sleep(10)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true", help="single cycle then exit")
+    ap.add_argument("--capital", type=float, default=10_000)
+    ap.add_argument("--queries", nargs="*", default=["SOL", "USDC"])
+    ap.add_argument("--live", action="store_true",
+                    help="trade real funds (needs I_UNDERSTAND_LIVE_TRADING=yes)")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        datefmt="%H:%M:%S")
+
+    cfg = Config(capital_usd=args.capital)
+    if args.live:
+        if os.getenv("I_UNDERSTAND_LIVE_TRADING") != "yes":
+            LOG.critical("--live requires I_UNDERSTAND_LIVE_TRADING=yes and a "
+                         "funded SOLANA_PRIVATE_KEY. Refusing to start.")
+            return 1
+        cfg.mode = "LIVE"
+
+    bot = Bot(cfg)
+    if args.once:
+        bot.run_once(args.queries)
+        LOG.info("equity $%s | open %d", f"{bot.equity():,.2f}", len(bot.positions))
+    else:
+        bot.run(args.queries)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
