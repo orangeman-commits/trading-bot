@@ -295,38 +295,106 @@ class GoPlusSecurity:
             return None
 
     def gates(self, chain_id: int, token: str,
-              max_tax_pct: float = 5.0) -> list[tuple[str, bool, str]]:
-        """Returns (gate_name, passed, detail). Missing data => failed."""
+              max_tax_pct: float = 5.0,
+              max_top10_pct: float = 25.0) -> list[tuple[str, str, str]]:
+        """Returns (gate_name, verdict, detail) where verdict is
+        PASS / REJECT / UNKNOWN.
+
+        Three states, not two. GoPlus coverage varies sharply by chain: the
+        full Ethereum response carries is_honeypot, is_mintable, lp_holders
+        and friends, while Base returns only 11 fields and omits all of them.
+        A missing field is NOT a failed check. Both still block a trade, but
+        conflating them tells you a token is dangerous when the truth is that
+        nobody looked.
+        """
         d = self.check(chain_id, token)
         if not d:
-            return [("evm_safety", False, "no security report — treat as reject")]
+            return [("evm_safety", "UNKNOWN", "no report from provider")]
 
-        def num(k, default=0.0):
-            try:
-                return float(d.get(k) or default)
-            except (TypeError, ValueError):
-                return default
+        out: list[tuple[str, str, str]] = []
 
-        buy_tax, sell_tax = num("buy_tax") * 100, num("sell_tax") * 100
-        return [
-            ("2.8_honeypot", d.get("is_honeypot") == "0",
-             f"honeypot={d.get('is_honeypot')}"),
-            ("2.9_round_trip_tax", (buy_tax + sell_tax) < max_tax_pct,
-             f"{buy_tax:.1f}%+{sell_tax:.1f}%"),
-            ("2.1_mintable", d.get("is_mintable") == "0",
-             f"mintable={d.get('is_mintable')}"),
-            ("2.2_pausable_transfer", d.get("transfer_pausable") == "0",
-             f"pausable={d.get('transfer_pausable')}"),
-            ("2.3_lp_locked", num("lp_holder_count") > 0
-             and any(float(h.get("percent", 0)) > 0.9
-                     for h in (d.get("lp_holders") or [])
-                     if h.get("is_locked") == 1),
-             f"lp_holders={d.get('lp_holder_count')}"),
-            ("2.5_owner_can_take_back", d.get("owner_change_balance") == "0",
-             f"owner_change_balance={d.get('owner_change_balance')}"),
-            ("2.11_blacklist_fn", d.get("is_blacklisted") == "0",
-             f"blacklist={d.get('is_blacklisted')}"),
-        ]
+        def three(name: str, key: str, good_value: str, label: str):
+            raw = d.get(key)
+            if raw is None:
+                out.append((name, "UNKNOWN", f"{label} not covered on this chain"))
+            else:
+                out.append((name, "PASS" if str(raw) == good_value else "REJECT",
+                            f"{label}={raw}"))
+
+        # Fields present on every chain GoPlus supports
+        try:
+            buy_t = float(d.get("buy_tax") or 0) * 100
+            sell_t = float(d.get("sell_tax") or 0) * 100
+            total = buy_t + sell_t
+            out.append(("2.9_round_trip_tax",
+                        "PASS" if total < max_tax_pct else "REJECT",
+                        f"buy {buy_t:.1f}% + sell {sell_t:.1f}%"))
+        except (TypeError, ValueError):
+            out.append(("2.9_round_trip_tax", "UNKNOWN", "tax fields unparseable"))
+
+        src = d.get("is_open_source")
+        out.append(("2.11_open_source",
+                    "UNKNOWN" if src is None else
+                    ("PASS" if str(src) == "1" else "REJECT"),
+                    f"open_source={src}"))
+
+        in_dex = d.get("is_in_dex")
+        out.append(("2.8_tradeable",
+                    "UNKNOWN" if in_dex is None else
+                    ("PASS" if str(in_dex) == "1" else "REJECT"),
+                    f"in_dex={in_dex}"))
+
+        # Holder concentration from the holders array when present
+        holders = d.get("holders")
+        if isinstance(holders, list) and holders:
+            pcts = []
+            for h in holders:
+                if str(h.get("is_locked")) == "1":
+                    continue                      # locked LP is not a whale
+                try:
+                    pcts.append(float(h.get("percent") or 0) * 100)
+                except (TypeError, ValueError):
+                    pass
+            if pcts:
+                pcts.sort(reverse=True)
+                top10 = sum(pcts[:10])
+                out.append(("2.4_top10_concentration",
+                            "PASS" if top10 < max_top10_pct else "REJECT",
+                            f"{top10:.1f}%"))
+            else:
+                out.append(("2.4_top10_concentration", "UNKNOWN",
+                            "holder percentages unparseable"))
+        else:
+            out.append(("2.4_top10_concentration", "UNKNOWN",
+                        "holders not covered on this chain"))
+
+        # Ownership renounced is a genuine positive signal
+        owner = d.get("owner_address")
+        if owner is None:
+            out.append(("2.6_ownership", "UNKNOWN", "owner not covered"))
+        elif owner in ("", "0x0000000000000000000000000000000000000000"):
+            out.append(("2.6_ownership", "PASS", "renounced"))
+        else:
+            out.append(("2.6_ownership", "REJECT", f"owner active {owner[:12]}…"))
+
+        # Chain-dependent fields: absent on Base, present on Ethereum/BSC
+        three("2.8_honeypot", "is_honeypot", "0", "honeypot")
+        three("2.1_mintable", "is_mintable", "0", "mintable")
+        three("2.2_pausable_transfer", "transfer_pausable", "0", "pausable")
+        three("2.5_owner_can_take_back", "owner_change_balance", "0",
+              "owner_change_balance")
+        three("2.11_blacklist_fn", "is_blacklisted", "0", "blacklist")
+
+        lp = d.get("lp_holders")
+        if lp is None:
+            out.append(("2.3_lp_locked", "UNKNOWN", "lp_holders not covered"))
+        else:
+            locked = any(str(h.get("is_locked")) == "1" and
+                         float(h.get("percent") or 0) > 0.9 for h in lp)
+            out.append(("2.3_lp_locked", "PASS" if locked else "REJECT",
+                        f"{len(lp)} lp holders"))
+
+        return out
 
 
 def preflight() -> None:

@@ -36,6 +36,15 @@ from typing import Optional
 
 LOG = logging.getLogger("analyze")
 
+# DexScreener chainId -> GoPlus chain id. GoPlus has no Robinhood Chain
+# support yet (launched 2026-07-01), so that entry is None and the screen
+# degrades to "unverifiable" rather than silently passing.
+EVM_CHAIN_IDS = {
+    "base": 8453, "ethereum": 1, "arbitrum": 42161, "optimism": 10,
+    "bsc": 56, "polygon": 137, "avalanche": 43114,
+    "robinhood": None, "robinhoodchain": None,
+}
+
 
 # ────────────────────────────── model ──────────────────────────────────────
 
@@ -248,6 +257,27 @@ def analyze(token: str, chain: str = "solana", capital: float = 10_000.0,
         except Exception as e:  # noqa: BLE001
             rep.gates_unknown.append(f"safety screen error: {e}")
 
+    elif c.chain in EVM_CHAIN_IDS:
+        gp_id = EVM_CHAIN_IDS[c.chain]
+        if gp_id is None:
+            rep.gates_unknown.append(
+                f"no token-security provider covers {c.chain} — "
+                f"LP lock, honeypot, tax and holder checks all UNVERIFIED")
+        else:
+            try:
+                from evm_venue import GoPlusSecurity
+                for name, verdict, detail in GoPlusSecurity().gates(
+                        gp_id, c.mint, cfg.max_round_trip_tax_pct,
+                        cfg.max_top10_pct):
+                    if verdict == "REJECT":
+                        rep.gates_failed.append(f"{name} = {detail}")
+                    elif verdict == "UNKNOWN":
+                        rep.gates_unknown.append(f"{name} = {detail}")
+            except Exception as e:  # noqa: BLE001
+                rep.gates_unknown.append(f"EVM safety screen error: {e}")
+    else:
+        rep.gates_unknown.append(f"no safety adapter for chain '{c.chain}'")
+
     rep.score, rep.score_parts = Scorer(cfg).score(c, sentiment=sentiment)
 
     # Verdict
@@ -296,6 +326,14 @@ def render(r: Report) -> str:
         f"fdv        ${r.fdv:,.0f}",
         f"age        {r.age_hours:.1f}h   buys/sells {r.buys}/{r.sells}",
     ]
+
+    bs = r.buys / max(r.sells, 1)
+    if bs < 0.8:
+        out.append(f"           ⚠ {r.sells:,} sells vs {r.buys:,} buys "
+                   f"({bs:.2f}) — net distribution")
+    if r.chg_1h < 0 and r.chg_6h < 0 and r.chg_24h > 20:
+        out.append(f"           ⚠ up on 24h but falling on 1h and 6h — "
+                   f"the move is unwinding")
 
     if r.vol_liq > 25:
         out.append(f"           ⚠ vol/liq {r.vol_liq:.0f}x suggests wash trading")

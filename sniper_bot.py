@@ -88,7 +88,7 @@ class Config:
     min_unique_traders_24h: int = 250
     min_buy_sell_ratio: float = 0.8
     max_buy_sell_ratio: float = 3.0
-    allowed_quotes: tuple = ("SOL", "WETH", "USDC")
+    allowed_quotes: tuple = ("SOL", "WETH", "ETH", "USDC", "USDT", "WSOL")
 
     # -- §2 safety --------------------------------------------------------
     min_lp_burned_pct: float = 90.0
