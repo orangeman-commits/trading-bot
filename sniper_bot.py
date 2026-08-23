@@ -32,6 +32,28 @@ import requests
 
 LOG = logging.getLogger("bot")
 
+
+
+def app_data_dir() -> Path:
+    """Writable per-user directory for state.
+
+    A packaged .app or .exe launches with its working directory set somewhere
+    read-only, so a relative db path fails with "unable to open database file".
+    """
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "TradingBot"
+    elif sys.platform == "win32":
+        base = Path(os.getenv("APPDATA", Path.home())) / "TradingBot"
+    else:
+        base = Path(os.getenv("XDG_DATA_HOME",
+                              Path.home() / ".local" / "share")) / "TradingBot"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+    except OSError:
+        import tempfile
+        return Path(tempfile.gettempdir())
+
 BURN_ADDRESSES = {
     "1nc1nerator11111111111111111111111111111111",
     "11111111111111111111111111111111",
