@@ -77,11 +77,14 @@ class Config:
     jupiter_quote: str = "https://api.jup.ag/swap/v1/quote"  # v6/lite-api deprecated
 
     # -- §1 discovery -----------------------------------------------------
-    min_pair_age_min: int = 45
-    max_pair_age_hr: int = 72
+    # Age is no longer a strategy filter. The floor stays small and non-zero
+    # because a pair minutes old has an unreadable holder graph and no sell
+    # history — set to 0 to disable entirely.
+    min_pair_age_min: int = 15
+    max_pair_age_hr: int = 0        # 0 = no upper limit
     min_liquidity_usd: float = 40_000
-    min_fdv_usd: float = 200_000
-    max_fdv_usd: float = 8_000_000
+    min_fdv_usd: float = 150_000
+    max_fdv_usd: float = 0          # 0 = no upper limit
     min_volume_24h_usd: float = 150_000
     min_vol_liq_ratio: float = 1.5
     max_vol_liq_ratio: float = 25.0
@@ -488,12 +491,16 @@ def discovery_filters(c: Candidate, cfg: Config) -> list[GateResult]:
         return GateResult(name, Verdict.PASS if ok else Verdict.REJECT, detail)
 
     age = c.age_minutes
+    age_ok = age >= cfg.min_pair_age_min and (
+        cfg.max_pair_age_hr <= 0 or age <= cfg.max_pair_age_hr * 60)
     return [
-        gate("1.1_pair_age", cfg.min_pair_age_min <= age <= cfg.max_pair_age_hr * 60,
-             f"{age:.0f}m"),
+        gate("1.1_pair_age", age_ok,
+             f"{age/24/60:.1f}d" if age > 1440 else f"{age:.0f}m"),
         gate("1.2_liquidity", c.liquidity_usd >= cfg.min_liquidity_usd,
              f"${c.liquidity_usd:,.0f}"),
-        gate("1.3_fdv", cfg.min_fdv_usd <= c.fdv_usd <= cfg.max_fdv_usd,
+        gate("1.3_fdv",
+             c.fdv_usd >= cfg.min_fdv_usd and
+             (cfg.max_fdv_usd <= 0 or c.fdv_usd <= cfg.max_fdv_usd),
              f"${c.fdv_usd:,.0f}"),
         gate("1.4_volume", c.volume_24h >= cfg.min_volume_24h_usd,
              f"${c.volume_24h:,.0f}"),
@@ -520,40 +527,70 @@ class Scorer:
               cohort_buys: int = 0,
               holder_growth_per_hr: float = 0.0,
               sentiment: Optional[dict] = None) -> tuple[int, dict]:
+        """Returns (score_0_100, parts).
+
+        The score is normalised against the signals actually MEASURABLE right
+        now, not against a theoretical 100. Without a cohort list and without
+        holder-growth history, 50 of the 100 raw points are unreachable, so an
+        absolute score can never clear a 62 threshold no matter how good the
+        token is. Normalising fixes that while keeping the parts honest:
+        `available` tells you how much of the full picture you are seeing.
+        """
         parts: dict[str, float] = {}
+        available = 0.0
 
-        # Liquidity depth, log-scaled against the floor (max 20)
-        parts["liquidity"] = min(
-            20.0, 20 * math.log10(max(c.liquidity_usd, 1) / self.cfg.min_liquidity_usd + 1)
-            / math.log10(11))
+        # Always measurable
+        # Liquidity: log scale that keeps resolving past the floor instead of
+        # saturating at 20 almost immediately (the old curve gave $200k and
+        # $2M the same score, which made ranking meaningless).
+        liq = max(c.liquidity_usd, 1.0)
+        parts["liquidity"] = max(0.0, min(
+            20.0, 20 * (math.log10(liq) - math.log10(self.cfg.min_liquidity_usd))
+            / (math.log10(5_000_000) - math.log10(self.cfg.min_liquidity_usd))))
+        available += 20.0
 
-        # Holder growth (max 20)
-        parts["holder_growth"] = min(20.0, holder_growth_per_hr / 5.0)
-
-        # Smart money — §3.1, all-or-nothing above the independence threshold.
-        # With no cohort list configured the 30 points are unreachable, so they
-        # redistribute to on-chain signals rather than making entry impossible.
-        parts["smart_money"] = (
-            30.0 if (self.cfg.cohort_enabled
-                     and cohort_buys >= self.cfg.min_cohort_wallets) else 0.0)
-
-        # Volume quality (max 15): penalise ratios that look washed
+        # Volume quality: continuous, peaking around 4x liquidity. Below ~1x
+        # is dead; above ~15x the churn is bots, not accumulation. The old
+        # three-bucket version scored a 0.3x token higher than a 13x one.
         r = c.vol_liq_ratio
-        parts["volume_quality"] = 15.0 if 2 <= r <= 10 else (7.0 if r < 2 else 3.0)
+        if r <= 0:
+            vq = 0.0
+        else:
+            vq = 15.0 * math.exp(-((math.log(r / 4.0)) ** 2) / 1.1)
+        parts["volume_quality"] = max(0.0, min(15.0, vq))
+        available += 15.0
 
-        # Sentiment — §3.2, capped, and a spike is a penalty
-        parts["sentiment"] = self._sentiment(sentiment)
+        # Measurable only with observation history
+        if holder_growth_per_hr > 0:
+            parts["holder_growth"] = min(20.0, holder_growth_per_hr / 5.0)
+            available += 20.0
+        else:
+            parts["holder_growth"] = 0.0          # unmeasured, not zero-valued
 
-        if not self.cfg.cohort_enabled:
-            # The 30 smart-money points are unreachable without a verified
-            # wallet list, so redistribute them across the on-chain signals
-            # rather than making every entry mathematically impossible.
-            for k, mult in (("liquidity", 1.75), ("holder_growth", 1.75),
-                            ("volume_quality", 1.5)):
-                parts[k] *= mult
+        # Measurable only with a verified cohort list
+        if self.cfg.cohort_enabled:
+            parts["smart_money"] = (
+                30.0 if cohort_buys >= self.cfg.min_cohort_wallets else 0.0)
+            available += 30.0
+        else:
+            parts["smart_money"] = 0.0
 
-        total = int(round(sum(parts.values())))
+        # Measurable only with attention data
+        if sentiment:
+            parts["sentiment"] = self._sentiment(sentiment)
+            available += 15.0
+        else:
+            parts["sentiment"] = 0.0
+
+        raw = sum(parts.values())
+        total = int(round(raw / available * 100)) if available > 0 else 0
+        parts["_available_weight"] = available
         return max(0, min(100, total)), parts
+
+    @staticmethod
+    def confidence(parts: dict) -> float:
+        """Fraction of the full signal set that was actually measurable."""
+        return (parts.get("_available_weight", 0.0)) / 100.0
 
     def _sentiment(self, s: Optional[dict]) -> float:
         if not s:

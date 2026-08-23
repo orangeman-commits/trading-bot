@@ -298,6 +298,15 @@ def analyze(token: str, chain: str = "solana", capital: float = 10_000.0,
     elif rep.score < cfg.min_score:
         rep.verdict = "WATCH"
         rep.reasons.append(f"score {rep.score} below threshold {cfg.min_score}")
+    elif rep.score_parts.get("_available_weight", 0) < 50:
+        # Never call something ELIGIBLE on a partial picture. With no cohort
+        # list and no holder history, only 35% of the signal weight is live —
+        # a high score there means "structurally sound", not "good trade".
+        rep.verdict = "WATCH"
+        rep.reasons.append(
+            f"score {rep.score} but only "
+            f"{rep.score_parts['_available_weight']:.0f}% of signals measurable "
+            f"— structural checks only, no smart-money or attention data")
     else:
         rep.verdict = "ELIGIBLE"
         rep.reasons.append(f"all gates passed, score {rep.score}")
@@ -367,9 +376,14 @@ def render(r: Report) -> str:
     if S.exit_impact_pct is not None:
         out.append(f"  exit impact  {S.exit_impact_pct:.2f}% at that size")
 
-    out += ["", f"SCORE  {r.score}/100"]
+    avail = (r.score_parts or {}).get("_available_weight", 0)
+    out += ["", f"SCORE  {r.score}/100   (from {avail:.0f}% of signal weight)"]
     for k, v in (r.score_parts or {}).items():
-        out.append(f"  {k:<16} {v:>6.1f}")
+        if k.startswith("_"):
+            continue
+        note = "  (unmeasured)" if v == 0 and k in (
+            "smart_money", "sentiment", "holder_growth") else ""
+        out.append(f"  {k:<16} {v:>6.1f}{note}")
 
     if r.attention:
         out += ["", "ATTENTION", f"  {r.attention}"]

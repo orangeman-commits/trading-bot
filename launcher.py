@@ -240,9 +240,17 @@ class App:
         for g in r.gates_unknown:
             self._w(f"  ? {g}\n", "muted")
 
+        avail = (r.score_parts or {}).get("_available_weight", 0)
         self._w(f"\nSCORE  {r.score}/100\n", "sect")
+        self._w(f"  based on {avail:.0f}% of the full signal set\n",
+                "warn" if avail < 50 else "muted")
         for k, v in (r.score_parts or {}).items():
-            self._w(f"  {k:<18}{v:>6.1f}\n", "muted" if v == 0 else "")
+            if k.startswith("_"):
+                continue
+            if v == 0 and k in ("smart_money", "sentiment", "holder_growth"):
+                self._w(f"  {k:<18}     —  unmeasured\n", "muted")
+            else:
+                self._w(f"  {k:<18}{v:>6.1f}\n")
 
         self._w("\nNOTES\n", "sect")
         for n in r.reasons:

@@ -30,9 +30,9 @@ A token enters the candidate set only if **all** hold:
 
 | # | Rule | Threshold | Rationale |
 |---|---|---|---|
-| 1.1 | Pair age | ≥ 45 min and ≤ 72 h | Under 45m the holder graph is unreadable; over 72h it is no longer this strategy |
+| 1.1 | Pair age | ≥ 15 min, no upper limit | Age is not a quality signal. The small floor stands only because a pair minutes old has no sell history and an unreadable holder graph. Set `max_pair_age_hr = 0` for no ceiling |
 | 1.2 | Liquidity (USD) | ≥ $40,000 | Below this you cannot exit a meaningful size |
-| 1.3 | FDV | ≥ $200k and ≤ $8M | Floor filters dust; ceiling is where asymmetry dies |
+| 1.3 | FDV | ≥ $150k, no upper limit | Floor filters dust. The ceiling was removed: a $40M token is a different trade from a $400k one, but not a disqualified one. Set `max_fdv_usd` > 0 to re-impose a cap |
 | 1.4 | 24h volume | ≥ $150,000 | Needs real two-sided flow |
 | 1.5 | Volume / liquidity ratio | ≥ 1.5 and ≤ 25 | Below = dead. **Above = wash trading** |
 | 1.6 | Unique 24h traders | ≥ 250 | Distinguishes a crowd from a bot farm |
@@ -69,6 +69,15 @@ a token dust amount. Many honeypots permit small sells.
 
 Gates 1 and 2 decide *eligibility*. Score decides *priority* among eligible
 tokens. Minimum score to trade: **62**.
+
+**Scores are normalised against measurable signals, not against 100.** Without
+a cohort list and without holder-growth history, 50 of the 100 raw points are
+unreachable, so an absolute score could never clear the threshold no matter how
+good the token was. The report shows what fraction of the signal set was live.
+
+**A verdict of ELIGIBLE requires ≥ 50% signal coverage.** Below that the best
+possible outcome is WATCH — a high score on structural signals alone means
+"not obviously broken", not "good trade".
 
 | Signal | Max pts | Method |
 |---|---|---|
