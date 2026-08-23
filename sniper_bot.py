@@ -92,6 +92,12 @@ class Config:
     min_buy_sell_ratio: float = 0.8
     max_buy_sell_ratio: float = 3.0
     allowed_quotes: tuple = ("SOL", "WETH", "ETH", "USDC", "USDT", "WSOL")
+    # Chains where non-crypto quote assets are normal rather than suspicious.
+    # Robinhood Chain exists to trade tokenised equities, so rejecting a pair
+    # for being quoted in NVDA was a category error: it is a characteristic of
+    # the venue, not a safety failure. It IS extra exposure — see the warning
+    # emitted in analyze.py — but that belongs in scoring, not a hard gate.
+    equity_quote_chains: tuple = ("robinhood", "robinhoodchain")
 
     # -- §2 safety --------------------------------------------------------
     min_lp_burned_pct: float = 90.0
@@ -553,7 +559,13 @@ def discovery_filters(c: Candidate, cfg: Config) -> list[GateResult]:
         gate("1.7_buy_sell_ratio",
              cfg.min_buy_sell_ratio <= c.buy_sell_ratio <= cfg.max_buy_sell_ratio,
              f"{c.buy_sell_ratio:.2f}"),
-        gate("1.8_quote_asset", c.quote_symbol in cfg.allowed_quotes, c.quote_symbol),
+        gate("1.8_quote_asset",
+             c.quote_symbol in cfg.allowed_quotes
+             or c.chain in cfg.equity_quote_chains,
+             c.quote_symbol + (" (equity quote — dual exposure)"
+                               if c.chain in cfg.equity_quote_chains
+                               and c.quote_symbol not in cfg.allowed_quotes
+                               else "")),
     ]
 
 

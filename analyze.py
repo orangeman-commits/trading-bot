@@ -387,6 +387,13 @@ def analyze(token: str, chain: str = "solana", capital: float = 10_000.0,
         rep.reasons.append(
             f"your own exit at recommended size moves price "
             f"{rep.sizing.exit_impact_pct:.1f}%")
+    if c.quote_symbol not in cfg.allowed_quotes and \
+            c.chain in cfg.equity_quote_chains:
+        rep.reasons.append(
+            f"quoted in {c.quote_symbol}, a tokenised equity — your P&L moves "
+            f"with both this token AND {c.quote_symbol}. Exiting routes through "
+            f"{c.quote_symbol}'s own liquidity, which is not screened here")
+
     if not sentiment:
         rep.reasons.append("no attention data — social signal unmeasured, not absent")
     return rep
