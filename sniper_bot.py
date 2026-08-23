@@ -97,6 +97,7 @@ class Config:
     max_deployer_pct: float = 5.0
     max_round_trip_tax_pct: float = 5.0
     max_exit_price_impact_pct: float = 4.0
+    max_risk_score: float = 60.0   # RugCheck normalised, higher is worse
     strict_lp_check: bool = True             # UNKNOWN LP status => reject
 
     # -- §3 scoring -------------------------------------------------------
@@ -413,10 +414,17 @@ class SafetyScreen:
                               Verdict.REJECT if v.rugged() else Verdict.PASS,
                               str(v.rugged())))
 
-        danger = v.danger_risks()
-        out.append(GateResult("2.0_danger_risks",
-                              Verdict.REJECT if danger else Verdict.PASS,
-                              ", ".join(danger) or "none"))
+        blocking = v.blocking_risks()
+        out.append(GateResult("2.0_blocking_risks",
+                              Verdict.REJECT if blocking else Verdict.PASS,
+                              ", ".join(blocking) or "none"))
+
+        rs = v.risk_score()
+        out.append(GateResult(
+            "2.0_risk_score",
+            Verdict.UNKNOWN if rs is None else
+            (Verdict.PASS if rs <= self.cfg.max_risk_score else Verdict.REJECT),
+            "unknown" if rs is None else f"{rs:.0f}/100"))
 
         lp = v.lp_locked_pct()
         out.append(GateResult(

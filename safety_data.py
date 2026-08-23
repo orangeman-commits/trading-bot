@@ -72,24 +72,42 @@ class ReportView:
         self.r = report or {}
 
     # -- gate 2.3 ---------------------------------------------------------
-    def lp_locked_pct(self) -> Optional[float]:
+    def primary_market(self) -> Optional[dict]:
+        """The pool holding the most liquidity.
+
+        Tokens routinely have hundreds or thousands of markets (BONK: 1284).
+        Taking the max lock% across all of them lets one obscure locked pool
+        vouch for a token whose real pool is wide open. The pool that matters
+        is the one your trade would actually route through.
+        """
         markets = self.r.get("markets") or []
-        best = None
+        best, best_liq = None, -1.0
         for m in markets:
             lp = m.get("lp") or {}
-            for key in ("lpLockedPct", "lpLocked", "lpBurnPct"):
-                if key in lp:
-                    val = _num(lp[key], -1)
-                    if val >= 0:
-                        best = val if best is None else max(best, val)
-                    break
-        if best is None:
-            for key in ("totalLPProvidersPct", "lpLockedPct"):
-                if key in self.r:
-                    best = _num(self.r[key], -1)
-                    if best < 0:
-                        best = None
+            liq = _num(lp.get("baseUSD")) + _num(lp.get("quoteUSD"))
+            if liq > best_liq:
+                best, best_liq = m, liq
         return best
+
+    def lp_locked_pct(self) -> Optional[float]:
+        """Lock percentage of the PRIMARY pool only."""
+        m = self.primary_market()
+        if not m:
+            return None
+        lp = m.get("lp") or {}
+        for key in ("lpLockedPct", "lpBurnPct"):
+            if key in lp:
+                v = _num(lp[key], -1)
+                if v >= 0:
+                    return v
+        return None
+
+    def primary_liquidity_usd(self) -> float:
+        m = self.primary_market()
+        if not m:
+            return 0.0
+        lp = m.get("lp") or {}
+        return _num(lp.get("baseUSD")) + _num(lp.get("quoteUSD"))
 
     # -- gates 2.4 / 2.5 --------------------------------------------------
     def holder_concentration(self) -> tuple[Optional[float], Optional[float]]:
@@ -129,9 +147,29 @@ class ReportView:
         return not tok.get("mintAuthority") and not tok.get("freezeAuthority")
 
     # -- aggregate risk ---------------------------------------------------
+    # Substring match against risk names that should hard-block regardless of
+    # score. Everything else feeds the normalised score instead: RugCheck
+    # flags "danger" liberally, and established tokens (BONK included) carry
+    # danger entries. Rejecting on any danger flag rejects nearly everything.
+    BLOCKING = ("honeypot", "mint authority", "freeze authority",
+                "copycat", "cannot sell", "transfer fee")
+
     def danger_risks(self) -> list[str]:
         return [x.get("name", "?") for x in (self.r.get("risks") or [])
                 if str(x.get("level", "")).lower() in ("danger", "high", "critical")]
+
+    def blocking_risks(self) -> list[str]:
+        out = []
+        for x in (self.r.get("risks") or []):
+            name = str(x.get("name", ""))
+            if any(b in name.lower() for b in self.BLOCKING):
+                out.append(name)
+        return out
+
+    def risk_score(self) -> Optional[float]:
+        """RugCheck's normalised risk score, 0-100. Higher is worse."""
+        v = self.r.get("score_normalised")
+        return _num(v, -1) if v is not None else None
 
     def rugged(self) -> bool:
         return bool(self.r.get("rugged"))
@@ -147,7 +185,11 @@ def verify_schema(mint: str) -> None:
     v = ReportView(rep)
     top10, largest = v.holder_concentration()
     print(f"top-level keys : {sorted(rep.keys())}")
-    print(f"lp_locked_pct  : {v.lp_locked_pct()}")
+    print(f"markets        : {len(rep.get('markets') or [])}")
+    print(f"primary liq    : ${v.primary_liquidity_usd():,.0f}")
+    print(f"lp_locked_pct  : {v.lp_locked_pct()}  (primary pool only)")
+    print(f"risk_score     : {v.risk_score()}  (0-100, higher is worse)")
+    print(f"blocking risks : {v.blocking_risks()}")
     print(f"top10 / largest: {top10} / {largest}")
     print(f"creator_pct    : {v.creator_pct()}")
     print(f"transfer_fee   : {v.transfer_fee_pct()}")
