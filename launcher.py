@@ -80,9 +80,175 @@ class App:
 
         nb = ttk.Notebook(root)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
+        self._tab_analyze(nb)
         self._tab_control(nb)
         self._tab_creds(nb)
         self._pump()
+
+    # ── analyze ────────────────────────────────────────────────────────
+    def _tab_analyze(self, nb):
+        f = ttk.Frame(nb)
+        nb.add(f, text="Analyze")
+
+        bar = ttk.Frame(f)
+        bar.pack(fill="x", **PAD)
+        ttk.Label(bar, text="Token address").pack(side="left")
+        self.addr = tk.StringVar()
+        e = ttk.Entry(bar, textvariable=self.addr, width=46)
+        e.pack(side="left", padx=6)
+        e.bind("<Return>", lambda _ev: self.run_analysis())
+
+        ttk.Label(bar, text="Capital $").pack(side="left", padx=(10, 0))
+        self.an_capital = tk.StringVar(value="1000")
+        ttk.Entry(bar, textvariable=self.an_capital, width=8).pack(side="left", padx=6)
+
+        self.an_btn = ttk.Button(bar, text="Analyze", command=self.run_analysis)
+        self.an_btn.pack(side="left", padx=6)
+        ttk.Button(bar, text="Clear",
+                   command=lambda: self._an_clear()).pack(side="left")
+
+        self.an_status = tk.StringVar(value="Paste a Solana mint or EVM address")
+        ttk.Label(f, textvariable=self.an_status,
+                  foreground="#666").pack(anchor="w", **PAD)
+
+        self.out = scrolledtext.ScrolledText(f, height=26, wrap="word",
+                                             font=("Menlo", 11), spacing1=1)
+        self.out.pack(fill="both", expand=True, **PAD)
+
+        for tag, cfg_ in {
+            "h1":    {"font": ("Menlo", 16, "bold")},
+            "sect":  {"font": ("Menlo", 11, "bold"), "spacing1": 10},
+            "good":  {"foreground": "#0a7d28"},
+            "bad":   {"foreground": "#c02020"},
+            "warn":  {"foreground": "#b06000"},
+            "muted": {"foreground": "#777"},
+            "big":   {"font": ("Menlo", 13, "bold")},
+        }.items():
+            self.out.tag_configure(tag, **cfg_)
+        self.out.configure(state="disabled")
+
+    def _an_clear(self):
+        self.out.configure(state="normal")
+        self.out.delete("1.0", "end")
+        self.out.configure(state="disabled")
+        self.an_status.set("Paste a Solana mint or EVM address")
+
+    def _w(self, text, *tags):
+        self.out.configure(state="normal")
+        self.out.insert("end", text, tags)
+        self.out.configure(state="disabled")
+        self.out.see("end")
+
+    def run_analysis(self):
+        addr = self.addr.get().strip()
+        if not addr:
+            messagebox.showinfo(APP, "Paste a token address first.")
+            return
+        try:
+            cap = float(self.an_capital.get())
+        except ValueError:
+            messagebox.showerror(APP, "Capital must be a number.")
+            return
+
+        self._an_clear()
+        self.an_btn.configure(state="disabled")
+        self.an_status.set("Analyzing… (fetching market data and safety report)")
+
+        def work():
+            try:
+                from analyze import analyze
+                r = analyze(addr, "solana", cap)
+                self.root.after(0, lambda: self._render(r, addr))
+            except Exception as ex:
+                self.root.after(0, lambda: self._an_error(ex))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _an_error(self, ex):
+        self.an_btn.configure(state="normal")
+        self.an_status.set("Failed")
+        self._w(f"Analysis failed: {ex}\n", "bad")
+
+    def _render(self, r, addr):
+        self.an_btn.configure(state="normal")
+        if not r:
+            self.an_status.set("Not found")
+            self._w(f"No trading pair found for {addr}.\n", "bad")
+            self._w("Check the address, and that the token has a live DEX pair.\n",
+                    "muted")
+            return
+
+        self.an_status.set(f"{r.symbol} on {r.chain}")
+        tone = {"ELIGIBLE": "good", "WATCH": "warn"}.get(r.verdict, "bad")
+        self._w(f"{r.symbol}", "h1")
+        self._w(f"   {r.verdict}\n", tone)
+        self._w(f"{r.mint}\n", "muted")
+        self._w(f"{r.chain}  ·  {r.age_hours:.0f}h old\n\n", "muted")
+
+        # Market
+        self._w("MARKET\n", "sect")
+        self._w(f"  price        ${r.price:.8g}\n")
+        for label, v in (("1h", r.chg_1h), ("6h", r.chg_6h), ("24h", r.chg_24h)):
+            self._w(f"  {label:<12} ")
+            self._w(f"{v:+.1f}%\n", "good" if v >= 0 else "bad")
+        self._w(f"  liquidity    ${r.liquidity:,.0f}\n")
+        self._w(f"  volume 24h   ${r.volume_24h:,.0f}  ({r.vol_liq:.1f}x liq)\n")
+        self._w(f"  fdv          ${r.fdv:,.0f}\n")
+        bs = r.buys / max(r.sells, 1)
+        self._w(f"  buys/sells   {r.buys:,} / {r.sells:,}  ({bs:.2f})\n",
+                "bad" if bs < 0.8 else "")
+        if bs < 0.8:
+            self._w("  ⚠ net distribution — sellers outnumber buyers\n", "bad")
+        if r.chg_1h < 0 and r.chg_6h < 0 and r.chg_24h > 20:
+            self._w("  ⚠ up on 24h but falling on 1h and 6h — move unwinding\n", "bad")
+        if r.vol_liq < 1.5:
+            self._w(f"  ⚠ vol/liq {r.vol_liq:.1f}x — thin, hard to exit\n", "warn")
+        elif r.vol_liq > 25:
+            self._w(f"  ⚠ vol/liq {r.vol_liq:.0f}x — possible wash trading\n", "bad")
+
+        # Sizing first: the actionable number
+        S = r.sizing
+        self._w("\nPOSITION SIZE\n", "sect")
+        self._w(f"  ${S.recommended:,.0f}\n", "big")
+        self._w(f"  limited by {S.binding_constraint}\n", "muted")
+        self._w(f"    risk budget    ${S.max_by_risk:,.0f}\n", "muted")
+        self._w(f"    liquidity cap  ${S.max_by_liquidity:,.0f}\n", "muted")
+        self._w(f"    position cap   ${S.max_by_rule:,.0f}\n", "muted")
+        if S.exit_impact_pct is not None:
+            tag = "bad" if S.exit_impact_pct > 4 else "muted"
+            self._w(f"  your exit moves price {S.exit_impact_pct:.2f}%\n", tag)
+
+        # Levels
+        L = r.levels
+        self._w("\nLEVELS\n", "sect")
+        self._w(f"  already +{L.move_pct:.0f}% off the base\n",
+                "warn" if L.move_pct > 60 else "muted")
+        for k, v in L.entries.items():
+            self._w(f"  entry {k:<18} ${v:.8g}  ({(v/r.price-1)*100:+.1f}%)\n")
+        self._w(f"  stop  {'':<18} ${L.stop:.8g}  ({L.stop_pct:.1f}%)\n", "bad")
+        self._w(f"  {L.stop_basis}\n", "muted")
+        self._w(f"  target 2R{'':<14} ${L.targets['2R']:.8g}\n", "good")
+        self._w(f"  R:R                     {L.rr_at_moderate:.1f}:1\n")
+
+        # Gates
+        self._w(f"\nSAFETY  ({len(r.gates_passed)} passed, "
+                f"{len(r.gates_failed)} failed, "
+                f"{len(r.gates_unknown)} unverified)\n", "sect")
+        for g in r.gates_passed:
+            self._w(f"  ✓ {g}\n", "good")
+        for g in r.gates_failed:
+            self._w(f"  ✕ {g}\n", "bad")
+        for g in r.gates_unknown:
+            self._w(f"  ? {g}\n", "muted")
+
+        self._w(f"\nSCORE  {r.score}/100\n", "sect")
+        for k, v in (r.score_parts or {}).items():
+            self._w(f"  {k:<18}{v:>6.1f}\n", "muted" if v == 0 else "")
+
+        self._w("\nNOTES\n", "sect")
+        for n in r.reasons:
+            self._w(f"  • {n}\n", "muted")
+        self._w("\nLevels are arithmetic on observed structure, not forecasts.\n",
+                "muted")
 
     # ── controls ───────────────────────────────────────────────────────
     def _tab_control(self, nb):

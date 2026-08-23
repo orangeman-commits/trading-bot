@@ -91,6 +91,7 @@ class Report:
     sizing: Optional[Sizing] = None
     gates_failed: list = field(default_factory=list)
     gates_unknown: list = field(default_factory=list)
+    gates_passed: list = field(default_factory=list)
     score: int = 0
     score_parts: dict = field(default_factory=dict)
     verdict: str = "UNKNOWN"
@@ -233,7 +234,9 @@ def analyze(token: str, chain: str = "solana", capital: float = 10_000.0,
 
     # Discovery + safety gates
     for g in discovery_filters(c, cfg):
-        if not g.ok:
+        if g.ok:
+            rep.gates_passed.append(f"{g.name} = {g.detail}")
+        else:
             rep.gates_failed.append(f"{g.name} = {g.detail}")
 
     if c.chain == "solana":
@@ -254,6 +257,8 @@ def analyze(token: str, chain: str = "solana", capital: float = 10_000.0,
                     rep.gates_failed.append(f"{g.name} = {g.detail}")
                 elif g.verdict is Verdict.UNKNOWN:
                     rep.gates_unknown.append(g.name)
+                else:
+                    rep.gates_passed.append(f"{g.name} = {g.detail}")
         except Exception as e:  # noqa: BLE001
             rep.gates_unknown.append(f"safety screen error: {e}")
 
@@ -273,6 +278,8 @@ def analyze(token: str, chain: str = "solana", capital: float = 10_000.0,
                         rep.gates_failed.append(f"{name} = {detail}")
                     elif verdict == "UNKNOWN":
                         rep.gates_unknown.append(f"{name} = {detail}")
+                    else:
+                        rep.gates_passed.append(f"{name} = {detail}")
             except Exception as e:  # noqa: BLE001
                 rep.gates_unknown.append(f"EVM safety screen error: {e}")
     else:
