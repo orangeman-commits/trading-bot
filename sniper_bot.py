@@ -164,6 +164,13 @@ class Config:
     # -- loop -------------------------------------------------------------
     scan_interval_sec: int = 120
     exit_check_interval_sec: int = 30
+    # ── micro mode ──────────────────────────────────────────────────
+    # For live-execution smoke tests with an amount you can afford to lose
+    # outright. Risk control here is NOT the sizing rules — it is the fact
+    # that the wallet only holds this much. All §2 safety gates stay on.
+    micro_mode: bool = False
+    min_position_usd: float = 25.0
+
     db_path: str = field(default_factory=lambda: str(app_data_dir() / "bot_state.db"))
     halt_file: str = field(default_factory=lambda: str(app_data_dir() / "HALT"))
 
@@ -854,7 +861,18 @@ def evaluate_exits(pos: Position, live: Candidate, cfg: Config,
             hourly < pos.entry_hourly_volume * cfg.volume_death_pct / 100:
         return ExitSignal(1.0, "6.2.3 volume collapse")
 
-    # §6.1 profit ladder
+    # §6.1 profit ladder.
+    # In micro mode a 50% partial on a $20 position is a $10 sell, where
+    # fixed fees are a large share of proceeds. Take the whole thing at TP1.
+    if cfg.micro_mode:
+        if gain >= cfg.tp1_gain_pct:
+            return ExitSignal(1.0, f"6.1 micro-mode full exit at {gain:+.0f}%")
+        if pos.high_water_price > 0:
+            dd = (1 - price / pos.high_water_price) * 100
+            if gain > 20 and dd >= cfg.trailing_stop_pct:
+                return ExitSignal(1.0, f"6.1 trailing stop -{dd:.0f}% from high")
+        return None
+
     if not pos.tp1_done and gain >= cfg.tp1_gain_pct:
         pos.tp1_done = True
         return ExitSignal(cfg.tp1_sell_pct / 100, f"6.1 TP1 at {gain:+.0f}%")
@@ -1103,6 +1121,14 @@ class Bot:
         self.save_positions()
 
     def position_size(self, c: Candidate) -> float:
+        if self.cfg.micro_mode:
+            # One position, effectively the whole account. Still capped by
+            # pool depth so the exit remains possible.
+            liq_cap = c.liquidity_usd * self.cfg.max_pct_of_liquidity / 100
+            size = min(self.cfg.capital_usd * 0.9, liq_cap)
+            if c.chain in self.cfg.partial_coverage_chains:
+                size *= self.cfg.partial_coverage_size_mult
+            return size
         base = self.cfg.capital_usd * self.cfg.base_position_pct / 100
         cap = self.cfg.capital_usd * self.cfg.max_position_pct / 100
         liq_cap = c.liquidity_usd * self.cfg.max_pct_of_liquidity / 100
@@ -1130,7 +1156,7 @@ class Bot:
             return
 
         size_usd = self.position_size(c)
-        if size_usd < 25:
+        if size_usd < self.cfg.min_position_usd:
             return
         info = self.rpc.mint_info(c.mint)
         if not info:
@@ -1332,6 +1358,9 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="single cycle then exit")
     ap.add_argument("--capital", type=float, default=10_000)
     ap.add_argument("--queries", nargs="*", default=["SOL", "USDC"])
+    ap.add_argument("--micro", action="store_true",
+                    help="single position at ~90%% of capital; for live "
+                         "execution tests with money you can lose outright")
     ap.add_argument("--live", action="store_true",
                     help="trade real funds (needs I_UNDERSTAND_LIVE_TRADING=yes)")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -1343,6 +1372,14 @@ def main() -> int:
         datefmt="%H:%M:%S")
 
     cfg = Config(capital_usd=args.capital)
+    if args.micro:
+        cfg.micro_mode = True
+        cfg.max_concurrent_positions = 1
+        cfg.min_position_usd = 5.0
+        cfg.max_deployed_pct = 100.0
+        LOG.warning("MICRO MODE: one position at ~90%% of $%s. Sizing rules "
+                    "are off; safety gates are NOT. Fees are a large share "
+                    "of a position this small.", f"{args.capital:,.0f}")
     if args.live:
         if os.getenv("I_UNDERSTAND_LIVE_TRADING") != "yes":
             LOG.critical("--live requires I_UNDERSTAND_LIVE_TRADING=yes and a "
