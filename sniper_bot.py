@@ -97,7 +97,13 @@ class Config:
     # better one than transaction counts.
     max_repeat_buy_skew: float = 3.0
     max_buy_sell_ratio: float = 3.0
-    allowed_quotes: tuple = ("SOL", "WETH", "ETH", "USDC", "USDT", "WSOL")
+    # Native/wrapped-native quote assets across every chain this bot trades.
+    # WBNB was missing — BNB Chain analysis silently failed 1.8 on the first
+    # real token tried there, the same class of gap as the earlier NVDA miss
+    # on Robinhood Chain: a chain gets exercised and its quote symbol wasn't
+    # in the list yet.
+    allowed_quotes: tuple = ("SOL", "WETH", "ETH", "USDC", "USDT", "WSOL",
+                             "WBNB", "BNB", "WMATIC", "MATIC", "WAVAX", "AVAX")
     # Chains where non-crypto quote assets are normal rather than suspicious.
     # Robinhood Chain exists to trade tokenised equities, so rejecting a pair
     # for being quoted in NVDA was a category error: it is a characteristic of
@@ -170,6 +176,29 @@ class Config:
     # that the wallet only holds this much. All §2 safety gates stay on.
     micro_mode: bool = False
     min_position_usd: float = 25.0
+
+    # ── ratcheting stop ─────────────────────────────────────────────
+    # (gain_reached_pct, stop_moves_to_gain_pct). Once a rung is reached the
+    # stop NEVER moves back down. This is what converts an unrealised gain
+    # into a floor you cannot give back — the alternative is watching a 3x
+    # round-trip to zero, which is the single most common way these trades
+    # end badly.
+    ratchet_rungs: tuple = (
+        (30.0,   -10.0),   # +30%  -> stop just under entry
+        (50.0,     0.0),   # +50%  -> breakeven, trade is now free
+        (100.0,   40.0),   # 2x    -> lock 40%
+        (200.0,  120.0),   # 3x    -> lock 120%
+        (300.0,  200.0),   # 4x    -> lock 200%
+        (500.0,  350.0),
+    )
+    take_profit_x: float = 3.0        # full exit at this multiple; 0 = never
+    ratchet_enabled: bool = True
+    # Discrete rungs alone leave gaps: peak +60% with the next rung at +100%
+    # means the only floor is breakeven, and the whole +60% can evaporate.
+    # This caps how much of the PEAK gain you may hand back, whatever rung
+    # you are on. Applies once the peak clears ratchet_min_gain.
+    max_giveback_pct: float = 40.0
+    ratchet_min_gain: float = 25.0
 
     db_path: str = field(default_factory=lambda: str(app_data_dir() / "bot_state.db"))
     halt_file: str = field(default_factory=lambda: str(app_data_dir() / "HALT"))
@@ -809,6 +838,25 @@ class LiveBrokerAdapter:
 
 # ─────────────────────────── exit engine §6 ────────────────────────────────
 
+def ratchet_stop_pct(gain_pct: float, high_water_gain: float,
+                     cfg: "Config") -> float:
+    """Stop level (as a gain %) given how far the trade has run.
+
+    Uses the HIGH WATER gain, not the current one — the stop must not fall
+    back when price retraces. Returns the hard stop until the first rung is
+    reached.
+    """
+    level = cfg.hard_stop_pct
+    for trigger, stop_at in cfg.ratchet_rungs:
+        if high_water_gain >= trigger:
+            level = max(level, stop_at)
+    # Proportional floor: never hand back more than max_giveback_pct of peak.
+    if high_water_gain >= cfg.ratchet_min_gain:
+        proportional = high_water_gain * (1 - cfg.max_giveback_pct / 100)
+        level = max(level, proportional)
+    return level
+
+
 @dataclass
 class SellResult:
     """Sells must report success. Returning a bare float made it impossible
@@ -861,16 +909,24 @@ def evaluate_exits(pos: Position, live: Candidate, cfg: Config,
             hourly < pos.entry_hourly_volume * cfg.volume_death_pct / 100:
         return ExitSignal(1.0, "6.2.3 volume collapse")
 
-    # §6.1 profit ladder.
-    # In micro mode a 50% partial on a $20 position is a $10 sell, where
-    # fixed fees are a large share of proceeds. Take the whole thing at TP1.
+    # §6.1b ratcheting stop — runs before the ladder and before the hard stop.
+    if cfg.ratchet_enabled:
+        hw_gain = pos.gain_pct(pos.high_water_price)
+        stop_at = ratchet_stop_pct(gain, hw_gain, cfg)
+        if gain <= stop_at:
+            locked = "locked in" if stop_at > 0 else "at"
+            return ExitSignal(
+                1.0, f"6.1b ratchet stop — peaked {hw_gain:+.0f}%, "
+                     f"{locked} {stop_at:+.0f}%, now {gain:+.0f}%")
+        if cfg.take_profit_x > 0 and gain >= (cfg.take_profit_x - 1) * 100:
+            return ExitSignal(
+                1.0, f"6.1b target {cfg.take_profit_x:.0f}x reached "
+                     f"({gain:+.0f}%)")
+        return None
+
     if cfg.micro_mode:
         if gain >= cfg.tp1_gain_pct:
             return ExitSignal(1.0, f"6.1 micro-mode full exit at {gain:+.0f}%")
-        if pos.high_water_price > 0:
-            dd = (1 - price / pos.high_water_price) * 100
-            if gain > 20 and dd >= cfg.trailing_stop_pct:
-                return ExitSignal(1.0, f"6.1 trailing stop -{dd:.0f}% from high")
         return None
 
     if not pos.tp1_done and gain >= cfg.tp1_gain_pct:
@@ -1358,6 +1414,8 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="single cycle then exit")
     ap.add_argument("--capital", type=float, default=10_000)
     ap.add_argument("--queries", nargs="*", default=["SOL", "USDC"])
+    ap.add_argument("--target", type=float, default=3.0,
+                    help="full exit multiple, e.g. 2 or 3 (0 = ride the ratchet)")
     ap.add_argument("--micro", action="store_true",
                     help="single position at ~90%% of capital; for live "
                          "execution tests with money you can lose outright")
@@ -1372,6 +1430,7 @@ def main() -> int:
         datefmt="%H:%M:%S")
 
     cfg = Config(capital_usd=args.capital)
+    cfg.take_profit_x = args.target
     if args.micro:
         cfg.micro_mode = True
         cfg.max_concurrent_positions = 1

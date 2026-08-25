@@ -296,7 +296,9 @@ class GoPlusSecurity:
 
     def gates(self, chain_id: int, token: str,
               max_tax_pct: float = 5.0,
-              max_top10_pct: float = 25.0) -> list[tuple[str, str, str]]:
+              max_top10_pct: float = 25.0,
+              observed_volume_24h: float = 0.0,
+              observed_pool_count: int = 0) -> list[tuple[str, str, str]]:
         """Returns (gate_name, verdict, detail) where verdict is
         PASS / REJECT / UNKNOWN.
 
@@ -350,10 +352,24 @@ class GoPlusSecurity:
                     f"open_source={src}"))
 
         in_dex = d.get("is_in_dex")
-        out.append(("2.8_tradeable",
-                    "UNKNOWN" if in_dex is None else
-                    ("PASS" if str(in_dex) == "1" else "REJECT"),
-                    f"in_dex={in_dex}"))
+        # GoPlus's is_in_dex has shown stale/false negatives on newer chains
+        # (seen on Robinhood Chain: is_in_dex=0 on a token with $1.7M/day
+        # volume and 6,500+ transactions in the SAME report). Real observed
+        # market activity is direct, harder-to-fake evidence than a single
+        # provider flag, so it overrides a REJECT here — but not a PASS
+        # claim; we still note the disagreement rather than hiding it.
+        has_real_activity = observed_volume_24h > 1000 or observed_pool_count > 0
+        if in_dex is None:
+            out.append(("2.8_tradeable", "UNKNOWN", "in_dex not covered"))
+        elif str(in_dex) != "1" and has_real_activity:
+            out.append(("2.8_tradeable", "PASS",
+                       f"in_dex=0 but observed ${observed_volume_24h:,.0f} "
+                       f"24h volume across {observed_pool_count} pool(s) — "
+                       f"GoPlus flag appears stale, overridden by market data"))
+        else:
+            out.append(("2.8_tradeable",
+                        "PASS" if str(in_dex) == "1" else "REJECT",
+                        f"in_dex={in_dex}"))
 
         # Holder concentration from the holders array when present
         holders = d.get("holders")

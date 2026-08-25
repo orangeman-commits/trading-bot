@@ -561,9 +561,11 @@ def analyze(token: str, chain: str = "solana", capital: float = 10_000.0,
         else:
             try:
                 from evm_venue import GoPlusSecurity
+                obs_vol = gd.total_volume if gd else c.volume_24h
+                obs_pools = gd.pool_count if gd else 0
                 for name, verdict, detail in GoPlusSecurity().gates(
                         gp_id, c.mint, cfg.max_round_trip_tax_pct,
-                        cfg.max_top10_pct):
+                        cfg.max_top10_pct, obs_vol, obs_pools):
                     if verdict == "REJECT":
                         rep.gates_failed.append(f"{name} = {detail}")
                     elif verdict == "UNKNOWN":
